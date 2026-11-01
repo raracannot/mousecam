@@ -84,4 +84,12 @@ tools/            自动化验证脚本（CDP 驱动界面 + 录制回归）
 
 ## 许可证
 
-专有软件，见 [LICENSE](LICENSE)。第三方组件与分发义务见 [THIRD_PARTY.md](THIRD_PARTY.md)。
+[GPL-3.0](LICENSE)。
+
+你可以自由使用、修改、分发本项目（包括商用），但**分发修改后的版本时必须同样以 GPL-3.0 开源**，并保留版权声明。
+
+第三方组件与分发义务见 [THIRD_PARTY.md](THIRD_PARTY.md)。
+
+## 参与
+
+Issue 和 PR 都欢迎。开发环境的搭建见上面的「自行构建」，`tools/` 里有基于 CDP 的界面回归脚本，改动后建议跑一遍。
