@@ -1,0 +1,27 @@
+﻿const base = "http://127.0.0.1:9222";
+const ts = await (await fetch(`${base}/json`)).json();
+const p = ts.find(t => t.type === "page" && !t.url.startsWith("devtools://"));
+const ws = new WebSocket(p.webSocketDebuggerUrl);
+let id = 0; const pend = new Map();
+ws.onmessage = e => { const m = JSON.parse(e.data); if (m.id && pend.has(m.id)) { pend.get(m.id)(m.result); pend.delete(m.id); } };
+await new Promise(r => ws.onopen = r);
+const send = (m, params={}) => new Promise(r => { const i=++id; pend.set(i, r); ws.send(JSON.stringify({id:i, method:m, params})); });
+const ev = async (e) => { const r = await send("Runtime.evaluate", { expression: e, returnByValue: true, awaitPromise: true }); return r.result?.value; };
+await ev(`localStorage.removeItem('mc.params'); location.reload()`);
+await new Promise(r => setTimeout(r, 2500));
+console.log(await ev(`JSON.stringify(window.__mc.edit)`));
+// start recording: the frame must hide and the toggle must refuse clicks
+const on = await ev(`document.getElementById('hudToggle').classList.contains('is-on')`);
+console.log("frame on before record:", on);
+await ev(`document.getElementById('hudToggle').classList.contains('is-on') || document.getElementById('hudToggle').click()`);
+await new Promise(r => setTimeout(r, 700));
+await ev(`document.getElementById('recOrb').click()`);
+await new Promise(r => setTimeout(r, 1500));
+console.log("during recording:", await ev(`JSON.stringify({ state: document.getElementById('recState').textContent, toggle: document.getElementById('hudToggle').className, disabled: document.getElementById('hudToggle').classList.contains('is-disabled') })`));
+await ev(`document.getElementById('hudToggle').click()`);
+await new Promise(r => setTimeout(r, 500));
+console.log("after clicking the toggle mid-recording:", await ev(`document.getElementById('hudToggle').className`));
+await ev(`document.getElementById('recOrb').click()`);
+await new Promise(r => setTimeout(r, 2500));
+console.log("stopped:", await ev(`document.getElementById('recState').textContent`));
+ws.close();

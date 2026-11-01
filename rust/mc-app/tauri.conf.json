@@ -1,0 +1,36 @@
+{
+  "$schema": "https://schema.tauri.app/config/2",
+  "productName": "MouseCam",
+  "version": "0.1.0",
+  "identifier": "com.mousecam.app",
+  "build": {
+    "frontendDist": "./ui"
+  },
+  "app": {
+    "withGlobalTauri": true,
+    "windows": [],
+    "security": {
+      "csp": null,
+      "assetProtocol": {
+        "enable": true,
+        "scope": [
+          "**"
+        ]
+      }
+    }
+  },
+  "bundle": {
+    "active": true,
+    "targets": [
+      "msi"
+    ],
+    "icon": [
+      "icons/icon.ico"
+    ],
+    "shortDescription": "跟随鼠标的屏幕录制与取景工具",
+    "longDescription": "MouseCam 录制屏幕，并自动生成跟随鼠标的裁切视口。录制后可重新取景、裁切、手动调整轨迹再导出。",
+    "resources": {
+      "../../dist/ffmpeg.exe": "ffmpeg.exe"
+    }
+  }
+}

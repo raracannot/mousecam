@@ -1,0 +1,266 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+<meta charset="UTF-8" />
+<meta name="viewport" content="width=device-width, initial-scale=1.0" />
+<title>MouseCam</title>
+<link rel="stylesheet" href="app.css" />
+</head>
+<body>
+<div id="app">
+
+  <!-- ─── title bar ─────────────────────────────────────────── -->
+  <header class="titlebar" data-tauri-drag-region>
+    <div class="brand" data-tauri-drag-region>
+      <svg width="16" height="16" viewBox="0 0 16 16" fill="none" data-tauri-drag-region>
+        <rect x="1.2" y="2.4" width="13.6" height="11.2" rx="2.2" stroke="currentColor" stroke-width="1.3"/>
+        <circle cx="8" cy="8" r="2.1" stroke="currentColor" stroke-width="1.3"/>
+        <path d="M8 1v1.4M8 13.6V15M1 8h1.4M13.6 8H15" stroke="currentColor" stroke-width="1.3" stroke-linecap="round"/>
+      </svg>
+      <span data-tauri-drag-region>MouseCam</span>
+    </div>
+
+    <nav class="tabs" data-tauri-drag-region>
+      <button class="tab is-active" data-tab="edit">编辑</button>
+      <button class="tab" data-tab="record">录制</button>
+      <span class="tab-glider" data-tauri-drag-region></span>
+    </nav>
+
+    <div class="winbtns" data-tauri-drag-region>
+      <button class="wb" id="wbSettings" title="设置">
+        <svg width="12" height="12" viewBox="0 0 12 12" fill="none">
+          <circle cx="6" cy="6" r="1.9" stroke="currentColor" stroke-width="1.1"/>
+          <path d="M6 1.1v1.5M6 9.4v1.5M1.1 6h1.5M9.4 6h1.5M2.55 2.55l1.05 1.05M8.4 8.4l1.05 1.05M9.45 2.55L8.4 3.6M3.6 8.4L2.55 9.45"
+                stroke="currentColor" stroke-width="1.1" stroke-linecap="round"/>
+        </svg>
+      </button>
+      <button class="wb" id="wbMin" title="最小化">
+        <svg width="10" height="10" viewBox="0 0 10 10"><path d="M2 5h6" stroke="currentColor" stroke-width="1.2" stroke-linecap="round"/></svg>
+      </button>
+      <button class="wb" id="wbMax" title="最大化">
+        <svg width="10" height="10" viewBox="0 0 10 10"><rect x="2.2" y="2.2" width="5.6" height="5.6" rx="1" stroke="currentColor" stroke-width="1.1" fill="none"/></svg>
+      </button>
+      <button class="wb wb-close" id="wbClose" title="关闭">
+        <svg width="10" height="10" viewBox="0 0 10 10"><path d="M2.4 2.4l5.2 5.2M7.6 2.4L2.4 7.6" stroke="currentColor" stroke-width="1.2" stroke-linecap="round"/></svg>
+      </button>
+    </div>
+  </header>
+
+  <!-- ─── editor surface ────────────────────────────────────── -->
+  <main class="stage" id="stageEdit">
+
+    <section class="viewports">
+      <article class="vp">
+        <div class="vp-head">
+          <span class="dot dot-src"></span>
+          <span class="vp-title">原片 · 鼠标轨迹</span>
+          <span class="chip" id="monInfo">—</span>
+          <span class="spacer"></span>
+          <button class="head-btn" id="kfToggle" title="在画面上拖动以添加/移动跟随点">轨迹编辑</button>
+          <span class="chip chip-quiet" id="frameInfo">—</span>
+        </div>
+        <div class="vp-body" id="viewWrap">
+          <video id="viewVideo" class="vp-media" muted playsinline></video>
+          <canvas id="viewCanvas"></canvas>
+          <div class="vp-empty" id="viewEmpty">正在载入素材…</div>
+        </div>
+      </article>
+
+      <div class="split split-v" id="splitVp" title="拖动调整两栏宽度"></div>
+
+      <article class="vp">
+        <div class="vp-head">
+          <span class="dot dot-cam"></span>
+          <span class="vp-title">跟拍视口</span>
+          <span class="chip" id="cropInfo">—</span>
+          <span class="spacer"></span>
+          <button class="head-btn" id="btnProxy" title="按当前参数生成低清代理，用于顺滑播放">生成预览</button>
+          <span class="chip chip-quiet" id="expandInfo">—</span>
+        </div>
+        <div class="vp-body" id="cropWrap">
+          <video id="cropVideo" class="vp-media" muted playsinline></video>
+          <canvas id="cropCanvas"></canvas>
+          <div class="vp-empty" id="cropEmpty">—</div>
+        </div>
+      </article>
+    </section>
+
+    <div class="split split-h" id="splitStageA" title="拖动调整取景区高度"></div>
+
+    <!-- ─── timeline ────────────────────────────────────────── -->
+    <section class="timeline">
+      <div class="tl-head">
+        <select id="clipSel" class="clip-select" title="选择录制素材"></select>
+        <span class="vsep"></span>
+        <button class="icon-btn" id="btnPlay" title="播放 / 暂停">
+          <svg id="icoPlay" width="12" height="12" viewBox="0 0 12 12"><path d="M3.4 2.2l6 3.8-6 3.8z" fill="currentColor"/></svg>
+          <svg id="icoPause" width="12" height="12" viewBox="0 0 12 12" style="display:none"><rect x="3" y="2.4" width="2.2" height="7.2" fill="currentColor"/><rect x="6.8" y="2.4" width="2.2" height="7.2" fill="currentColor"/></svg>
+        </button>
+        <span class="tc" id="tcNow">00:00.00</span>
+        <span class="tc-sep">/</span>
+        <span class="tc tc-dim" id="tcTotal">00:00.00</span>
+        <span class="chip chip-trim" id="trimChip" style="display:none">—</span>
+        <span class="spacer"></span>
+        <button class="head-btn" id="loopToggle"
+                title="播放到尾帧后自动回到首帧继续播放">自动回放</button>
+        <button class="head-btn" id="trimToggle" title="开启后拖动时间线可框选保留区间">裁切</button>
+        <button class="head-btn" id="btnTrimClear" title="清除裁切（或双击时间线）">清除裁切</button>
+        <div class="seg seg-sm" id="tlZoom">
+          <button data-z="0" class="is-active">全览</button>
+          <button data-z="1">2×</button>
+          <button data-z="2">4×</button>
+        </div>
+      </div>
+      <div class="tl-body" id="tlBody">
+        <canvas id="tlCanvas"></canvas>
+      </div>
+    </section>
+
+    <!-- ─── parameters ──────────────────────────────────────── -->
+    <div class="split split-h" id="splitStageB" title="拖动调整参数区高度"></div>
+
+    <section class="params">
+      <div class="params-head">
+        <span>参数</span>
+        <span class="spacer"></span>
+        <button class="ghost-btn" id="btnReset">恢复默认</button>
+        <button class="primary-btn" id="btnExport">导出</button>
+      </div>
+      <div class="params-grid" id="paramsGrid">
+        <!-- rows injected by app.js -->
+      </div>
+    </section>
+  </main>
+
+  <!-- ─── recorder tab (placeholder for now) ────────────────── -->
+  <main class="stage is-hidden" id="stageRecord">
+    <section class="rec-preview">
+      <div class="vp-head">
+        <span class="dot dot-cam"></span>
+        <span class="vp-title">跟拍视口 · 预览</span>
+        <span class="chip" id="recCropInfo">—</span>
+        <select class="sel-mini" id="recMonitor" title="选择要录制的屏幕"></select>
+        <span class="spacer"></span>
+        <button class="head-btn is-on" id="hudToggle" title="在屏幕上显示跟拍取景框（不会被录进去）">取景框</button>
+        <span class="chip chip-quiet" id="recState">待机</span>
+      </div>
+      <div class="vp-body">
+        <img id="recPreview" alt="" />
+        <div class="vp-empty" id="recEmpty">预览启动中…</div>
+      </div>
+    </section>
+
+    <section class="rec-bar">
+      <button class="rec-orb" id="recOrb" title="开始 / 停止录制">
+        <span class="rec-dot"></span>
+        <span class="rec-square"></span>
+      </button>
+      <div class="rec-meta">
+        <div class="rec-time" id="recTime">00:00.0</div>
+        <div class="rec-hint" id="recHint">主显示器 · 30 fps · 同时生成原片 / 跟拍 / 轨迹</div>
+        <div class="rec-warn" id="recWarn"></div>
+      </div>
+      <span class="spacer"></span>
+      <label class="chk hw-chk" title="用显卡编码，大幅降低录制时的 CPU 占用">
+        <input type="checkbox" id="recHw" /> 硬件编码
+      </label>
+    </section>
+
+
+    <div class="split split-h" id="splitRecParams" title="拖动调整参数区高度"></div>
+
+    <section class="params">
+      <div class="params-head">
+        <span>跟拍参数</span>
+        <span class="spacer"></span>
+        <button class="ghost-btn" id="recReset">恢复默认</button>
+      </div>
+      <div class="hud-row">
+        <span class="hud-tag">取景框</span>
+        <label>线宽 <input type="range" id="hudWidth" min="1" max="6" step="1" value="2" /><em id="hudWidthVal">2</em></label>
+        <label class="chk"><input type="checkbox" id="hudLabel" checked /> 尺寸标签</label>
+        <label class="chk"><input type="checkbox" id="hudBrackets" checked /> 角标</label>
+      </div>
+      <div class="params-grid" id="recParamsGrid"></div>
+    </section>
+  </main>
+
+  <div class="toast" id="toast"></div>
+</div>
+  <div class="modal is-hidden" id="exportModal">
+    <div class="modal-card">
+      <div class="modal-head">导出设置</div>
+      <div class="modal-body">
+        <label class="frow"><span>格式</span>
+          <select class="sel-mini" id="exFormat">
+            <option value="mp4_h264">MP4 · H.264</option>
+            <option value="mp4_h264_nvenc">MP4 · H.264 (NVENC)</option>
+            <option value="mkv_h265">MKV · H.265</option>
+            <option value="webm_vp9">WebM · VP9</option>
+            <option value="gif">GIF</option>
+            <option value="mov_prores">MOV · ProRes</option>
+          </select>
+        </label>
+        <label class="frow"><span>质量</span>
+          <input type="range" id="exQuality" min="10" max="32" step="1" value="18" />
+          <em id="exQualityVal">18</em>
+        </label>
+        <label class="frow"><span>宽度</span>
+          <select class="sel-mini" id="exWidth">
+            <option value="0">跟拍参数里的宽度</option>
+            <option value="960">960</option>
+            <option value="1280">1280</option>
+            <option value="1920">1920</option>
+            <option value="2560">2560</option>
+          </select>
+        </label>
+        <label class="frow"><span>帧率</span>
+          <select class="sel-mini" id="exFps">
+            <option value="0">跟随素材</option>
+            <option value="30">30</option>
+            <option value="60">60</option>
+          </select>
+        </label>
+        <div class="fhint" id="exHint">输出到素材目录下的 export.*</div>
+      </div>
+      <div class="modal-foot">
+        <button class="head-btn" id="exCancel">取消</button>
+        <button class="head-btn is-on" id="exGo">开始导出</button>
+      </div>
+    </div>
+  </div>
+
+  
+  <!-- ─── app settings ─── -->
+  <div class="modal is-hidden" id="settingsModal">
+    <div class="modal-card modal-wide">
+      <div class="modal-head">设置</div>
+      <div class="modal-body">
+        <label class="frow frow-col"><span>输出文件夹</span>
+          <input type="text" id="setCaptures" class="txt-input" placeholder="留空则使用默认位置" />
+        </label>
+        <div class="fhint" id="setCapturesHint">录制的素材保存在这里，编辑页也从这里读取。</div>
+        <div class="frow frow-actions">
+          <button class="head-btn" id="setOpen">打开文件夹</button>
+          <button class="head-btn" id="setDefault">恢复默认位置</button>
+        </div>
+        <label class="frow frow-check"><input type="checkbox" id="setHw" /> 录制时默认使用硬件编码（NVENC）</label>
+        <label class="frow frow-check"><input type="checkbox" id="setHud" /> 录制时默认显示屏幕取景框</label>
+        <label class="frow frow-check"><input type="checkbox" id="setVerbose" /> 记录详细日志（排查问题时打开）</label>
+        <div class="frow frow-actions">
+          <button class="head-btn" id="setOpenLog">打开日志文件夹</button>
+        </div>
+        <div class="fhint" id="setAbout"></div>
+      </div>
+      <div class="modal-foot">
+        <button class="head-btn" id="setCancel">取消</button>
+        <button class="head-btn is-on" id="setSave">保存</button>
+      </div>
+    </div>
+  </div>
+
+  <script src="app.js"></script>
+
+  <!-- ─── export settings ─── -->
+</body>
+</html>

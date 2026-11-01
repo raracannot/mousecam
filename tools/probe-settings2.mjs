@@ -1,0 +1,14 @@
+﻿const base = "http://127.0.0.1:9222";
+const ts = await (await fetch(`${base}/json`)).json();
+const p = ts.find(t => t.type === "page" && !t.url.startsWith("devtools://"));
+const ws = new WebSocket(p.webSocketDebuggerUrl);
+let id = 0; const pend = new Map();
+ws.onmessage = e => { const m = JSON.parse(e.data); if (m.id && pend.has(m.id)) { pend.get(m.id)(m.result); pend.delete(m.id); } };
+await new Promise(r => ws.onopen = r);
+const send = (m, p={}) => new Promise(r => { const i=++id; pend.set(i, r); ws.send(JSON.stringify({id:i, method:m, params:p})); });
+const ev = async (e) => { const r = await send("Runtime.evaluate", {expression:e, returnByValue:true, awaitPromise:true}); return r.result?.value ?? ('EXC ' + (r.exceptionDetails?.text||'')); };
+console.log("typeof loadAppSettings:", await ev(`typeof loadAppSettings`));
+console.log("call it now:", await ev(`loadAppSettings().then(a => 'OK ' + JSON.stringify(a)).catch(e => 'ERR ' + e)`));
+console.log("state.appSettings:", await ev(`JSON.stringify(window.__mc.appSettings)`));
+console.log("state keys:", await ev(`Object.keys(window.__mc).join(',')`));
+ws.close();

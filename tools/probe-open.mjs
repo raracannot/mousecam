@@ -1,0 +1,14 @@
+﻿const base = "http://127.0.0.1:9222";
+const ts = await (await fetch(`${base}/json`)).json();
+const p = ts.find(t => t.type === "page" && !t.url.startsWith("devtools://"));
+const ws = new WebSocket(p.webSocketDebuggerUrl);
+let id = 0; const pend = new Map();
+ws.onmessage = e => { const m = JSON.parse(e.data); if (m.id && pend.has(m.id)) { pend.get(m.id)(m.result); pend.delete(m.id); } };
+await new Promise(r => ws.onopen = r);
+const send = (m, p={}) => new Promise(r => { const i=++id; pend.set(i, r); ws.send(JSON.stringify({id:i, method:m, params:p})); });
+const ev = async (e) => { const r = await send("Runtime.evaluate", {expression:e, returnByValue:true, awaitPromise:true}); return r.result?.value ?? ('EXC ' + (r.exceptionDetails?.text||'')); };
+console.log("open_folder(captures):", await ev(`window.__TAURI__.core.invoke('open_folder', { dir: ${JSON.stringify("E:\\RAYS\\Desktop\\workspace\\mousecam\\rust\\mc-engine\\captures")} }).then(r=>'OK').catch(e=>'ERR '+e)`));
+console.log("open_log()           :", await ev(`window.__TAURI__.core.invoke('open_log').then(r=>'OK').catch(e=>'ERR '+e)`));
+console.log("toast element z-index:", await ev(`(() => { const t = document.getElementById('toast'); if (!t) return 'no #toast'; const s = getComputedStyle(t); return JSON.stringify({ has: true, z: s.zIndex, pos: s.position }); })()`));
+console.log("modal z-index        :", await ev(`(() => { const m = document.getElementById('settingsModal'); const s = getComputedStyle(m); return JSON.stringify({ z: s.zIndex, pos: s.position }); })()`));
+ws.close();

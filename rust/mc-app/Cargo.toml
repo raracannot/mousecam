@@ -1,0 +1,34 @@
+[package]
+name = "mousecam"
+version = "0.1.0"
+edition = "2021"
+description = "MouseCam - follow-cam screen recorder"
+
+[build-dependencies]
+tauri-build = { version = "2", features = [] }
+
+[dependencies]
+tauri = { version = "2", features = ["protocol-asset"] }
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+mc-api = { path = "../mc-api" }
+mc-engine = { path = "../mc-engine" }
+windows = { version = "0.62.2", features = ["Win32_UI_HiDpi"] }
+
+[profile.release]
+opt-level = 2
+lto = false
+
+# A debug build must stay usable: at opt-level 0 the preview round trip was
+# 48 ms instead of 19 and recording cost 70% of a core instead of 42, which
+# reads as "the app got laggy" when nothing in the code did. Dependencies keep
+# debug symbols and assertions; only the optimisation level moves.
+[profile.dev]
+opt-level = 1
+debug = true
+
+[profile.dev.package.mc-engine]
+opt-level = 2
+
+[profile.dev.package.mc-api]
+opt-level = 2

@@ -1,0 +1,15 @@
+﻿const base = "http://127.0.0.1:9222";
+const ts = await (await fetch(`${base}/json`)).json();
+const p = ts.find(t => t.type === "page" && !t.url.startsWith("devtools://"));
+const ws = new WebSocket(p.webSocketDebuggerUrl);
+let id = 0; const pend = new Map();
+ws.onmessage = e => { const m = JSON.parse(e.data); if (m.id && pend.has(m.id)) { pend.get(m.id)(m.result); pend.delete(m.id); } };
+await new Promise(r => ws.onopen = r);
+const send = (m, params={}) => new Promise(r => { const i=++id; pend.set(i, r); ws.send(JSON.stringify({id:i, method:m, params})); });
+const ev = async (e) => { const r = await send("Runtime.evaluate", { expression: e, returnByValue: true, awaitPromise: true }); return r.result?.value ?? 'EXC'; };
+await ev(`document.getElementById('wbSettings').click()`);
+await new Promise(r => setTimeout(r, 800));
+console.log("hint:", await ev(`(() => { const h = document.getElementById('setCapturesHint'); return JSON.stringify({ text: h.textContent, cls: h.className, color: getComputedStyle(h).color }); })()`));
+const shot = await send("Page.captureScreenshot", { format: "png" });
+(await import('node:fs')).writeFileSync(process.argv[2], Buffer.from(shot.data, "base64"));
+ws.close();

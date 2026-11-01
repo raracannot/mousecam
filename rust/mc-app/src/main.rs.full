@@ -1,0 +1,265 @@
+#![cfg_attr(not(debug_assertions), windows_subsystem = "windows")]
+
+use base64::Engine as _;
+use mc_engine::clip::{find_ffmpeg, load_clip, settings_from_meta};
+use mc_engine::cursor::{arrow_sprite, draw as draw_cursor};
+use mc_engine::edit::parse_edit;
+use mc_engine::ffmpeg::FrameReader;
+use mc_engine::render::{bake_path, frame_src_rect};
+use mc_engine::resample::Resampler;
+use mc_engine::Settings;
+use serde::Serialize;
+use std::path::PathBuf;
+
+#[derive(Serialize, Clone)]
+struct ClipDto {
+    dir: String,
+    name: String,
+    fps: i32,
+    frames: i32,
+    duration: f64,
+    mon_x: i32,
+    mon_y: i32,
+    mon_w: i32,
+    mon_h: i32,
+}
+
+#[derive(Serialize)]
+struct BakeDto {
+    frames: i32,
+    fps: i32,
+    duration: f64,
+    mon: [i32; 4],
+    /// cx, cy, w, h per frame
+    path: Vec<[f32; 4]>,
+    /// camera tick index per frame (empty for old clips)
+    ticks: Vec<u32>,
+}
+
+fn captures_root() -> PathBuf {
+    if let Ok(d) = std::env::var("MC_CAPTURES") {
+        return PathBuf::from(d);
+    }
+    if let Ok(exe) = std::env::current_exe() {
+        let mut p = exe;
+        for _ in 0..8 {
+            p.pop();
+            for cand in [
+                "captures",
+                "dist/captures",
+                "mc-engine/captures",
+                "rust/mc-engine/captures",
+            ] {
+                let c = p.join(cand);
+                if c.is_dir() {
+                    return c;
+                }
+            }
+        }
+    }
+    PathBuf::from("captures")
+}
+
+fn clip_dto(dir: &PathBuf) -> Option<ClipDto> {
+    let clip = load_clip(dir).ok()?;
+    Some(ClipDto {
+        dir: dir.display().to_string(),
+        name: dir
+            .file_name()
+            .map(|s| s.to_string_lossy().to_string())
+            .unwrap_or_default(),
+        fps: clip.fps,
+        frames: clip.frame_count,
+        duration: clip.duration,
+        mon_x: clip.mon.x,
+        mon_y: clip.mon.y,
+        mon_w: clip.mon.w,
+        mon_h: clip.mon.h,
+    })
+}
+
+#[tauri::command]
+fn list_clips() -> Vec<ClipDto> {
+    let root = captures_root();
+    let mut out = Vec::new();
+    if let Ok(rd) = std::fs::read_dir(&root) {
+        for e in rd.flatten() {
+            let p = e.path();
+            if !p.is_dir() {
+                continue;
+            }
+            let name = p.file_name().map(|s| s.to_string_lossy().to_string());
+            if !name.as_deref().unwrap_or("").starts_with("rec_") {
+                continue;
+            }
+            if let Some(dto) = clip_dto(&p) {
+                out.push(dto);
+            }
+        }
+    }
+    out.sort_by(|a, b| b.name.cmp(&a.name));
+    out
+}
+
+#[tauri::command]
+fn open_clip(dir: String) -> Result<ClipDto, String> {
+    clip_dto(&PathBuf::from(dir)).ok_or_else(|| "无法打开该素材".to_string())
+}
+
+fn build_settings(dir: &str, edit_text: &str) -> Result<(Settings, mc_engine::EditList), String> {
+    let mut s = settings_from_meta(std::path::Path::new(dir))?;
+    let edit = parse_edit(edit_text);
+    edit.cam.apply(&mut s);
+    Ok((s, edit))
+}
+
+#[tauri::command]
+fn api_bake(dir: String, edit: String) -> Result<BakeDto, String> {
+    let clip = load_clip(std::path::Path::new(&dir))?;
+    let (s, e) = build_settings(&dir, &edit)?;
+    let (path, _ms) = bake_path(&clip, &s, &e);
+    Ok(BakeDto {
+        frames: clip.frame_count,
+        fps: clip.fps,
+        duration: clip.duration,
+        mon: [clip.mon.x, clip.mon.y, clip.mon.w, clip.mon.h],
+        path: path.iter().map(|f| [f.cx, f.cy, f.w, f.h]).collect(),
+        ticks: clip.frame_ticks.clone(),
+    })
+}
+
+#[tauri::command]
+fn track_points(dir: String) -> Result<Vec<[f32; 3]>, String> {
+    let clip = load_clip(std::path::Path::new(&dir))?;
+    // downsample to keep the JSON small; the overlay only needs the shape
+    let step = (clip.track.len() / 4000).max(1);
+    Ok(clip
+        .track
+        .iter()
+        .step_by(step)
+        .map(|p| [p.t as f32, p.x as f32, p.y as f32])
+        .collect())
+}
+
+fn encode_jpeg(bgra: &[u32], w: u32, h: u32, quality: u8) -> Result<String, String> {
+    let mut rgb = Vec::with_capacity((w as usize) * (h as usize) * 3);
+    for &p in bgra {
+        rgb.push((p & 0xFF) as u8);
+        rgb.push(((p >> 8) & 0xFF) as u8);
+        rgb.push(((p >> 16) & 0xFF) as u8);
+    }
+    let mut out = std::io::Cursor::new(Vec::new());
+    let mut enc = image::codecs::jpeg::JpegEncoder::new_with_quality(&mut out, quality);
+    enc.encode(&rgb, w, h, image::ExtendedColorType::Rgb8)
+        .map_err(|e| format!("JPEG 编码失败: {e}"))?;
+    Ok(format!(
+        "data:image/jpeg;base64,{}",
+        base64::engine::general_purpose::STANDARD.encode(out.into_inner())
+    ))
+}
+
+/// `kind`: "view" = whole frame, "crop" = the follow-cam viewport.
+#[tauri::command]
+fn still(dir: String, edit: String, frame: i32, max_w: u32, kind: String) -> Result<String, String> {
+    let clip = load_clip(std::path::Path::new(&dir))?;
+    let ff = find_ffmpeg().ok_or("找不到 ffmpeg.exe")?;
+    let (s, e) = build_settings(&dir, &edit)?;
+    let (path, _) = bake_path(&clip, &s, &e);
+
+    let frame = frame.clamp(0, (clip.frame_count - 1).max(0));
+    let t = frame as f64 / clip.fps as f64;
+
+    let mut rd = FrameReader::open(&ff, &clip.master, Some(t), clip.mon.w, clip.mon.h)
+        .map_err(|e| format!("解码失败: {e}"))?;
+    let mut src = vec![0u32; (clip.mon.w * clip.mon.h) as usize];
+    if !rd.read_frame(&mut src) {
+        return Err("无法解码该帧".into());
+    }
+
+    let mon = clip.mon;
+    let mut rs = Resampler::new();
+
+    if kind == "crop" {
+        let r = frame_src_rect(&path[frame as usize], mon);
+        let lx = (r.x - mon.x).max(0) as f32;
+        let ly = (r.y - mon.y).max(0) as f32;
+        let rw = r.w.min(mon.w).max(4) as f32;
+        let rh = r.h.min(mon.h).max(4) as f32;
+
+        let out_w = max_w.min(rw as u32).max(16) & !1;
+        let aspect = rw / rh;
+        let out_h = ((out_w as f32 / aspect).round() as u32).max(16) & !1;
+
+        let mut dst = vec![0u32; (out_w * out_h) as usize];
+        rs.prep(lx, ly, rw, rh, out_w as i32, out_h as i32);
+        rs.run(&src, mon.w, mon.h, &mut dst, out_w as i32);
+
+        if let Some(spr) = arrow_sprite() {
+            let cx = (e_cursor(&clip, &e, t).0 - r.x as f32) * (out_w as f32 / rw);
+            let cy = (e_cursor(&clip, &e, t).1 - r.y as f32) * (out_w as f32 / rw);
+            draw_cursor(&mut dst, out_w as i32, out_h as i32, cx, cy, out_w as f32 / rw, &spr);
+        }
+        encode_jpeg(&dst, out_w, out_h, 82)
+    } else {
+        let out_w = max_w.min(mon.w as u32).max(16) & !1;
+        let out_h = ((out_w as f32 / (mon.w as f32 / mon.h as f32)).round() as u32).max(16) & !1;
+        let mut dst = vec![0u32; (out_w * out_h) as usize];
+        rs.prep(0.0, 0.0, mon.w as f32, mon.h as f32, out_w as i32, out_h as i32);
+        rs.run(&src, mon.w, mon.h, &mut dst, out_w as i32);
+        encode_jpeg(&dst, out_w, out_h, 80)
+    }
+}
+
+fn e_cursor(clip: &mc_engine::ClipInfo, edit: &mc_engine::EditList, t: f64) -> (f32, f32) {
+    let p = mc_engine::edit::cursor_at(&clip.track, edit, t);
+    (p.x, p.y)
+}
+
+#[tauri::command]
+async fn export(dir: String, edit: String, out: String) -> Result<String, String> {
+    tauri::async_runtime::spawn_blocking(move || {
+        let clip = load_clip(std::path::Path::new(&dir))?;
+        let ff = find_ffmpeg().ok_or("找不到 ffmpeg.exe")?;
+        let (s, e) = build_settings(&dir, &edit)?;
+        let out_path = if out.is_empty() {
+            PathBuf::from(&dir).join("export.mp4")
+        } else {
+            PathBuf::from(out)
+        };
+        let sum = mc_engine::render_clip(
+            &clip,
+            &ff,
+            &out_path,
+            &s,
+            &e,
+            mc_engine::ffmpeg::VideoFormat::Mp4H264,
+            18,
+            |_, _| {},
+        )?;
+        Ok(format!(
+            "{}  ({} 帧 / {:.1}s)",
+            sum.out_path.display(),
+            sum.frames,
+            sum.duration
+        ))
+    })
+    .await
+    .map_err(|e| format!("导出线程失败: {e}"))?
+}
+
+fn main() {
+    // NOTE: do not call SetProcessDpiAwarenessContext here. Tauri sets the
+    // per-monitor-v2 context during its own setup, and a second call fails with
+    // ERROR_ACCESS_DENIED, aborting startup.
+    tauri::Builder::default()
+        .invoke_handler(tauri::generate_handler![
+            list_clips,
+            open_clip,
+            api_bake,
+            track_points,
+            still,
+            export
+        ])
+        .run(tauri::generate_context!())
+        .expect("MouseCam 启动失败");
+}

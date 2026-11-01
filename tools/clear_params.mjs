@@ -1,0 +1,12 @@
+﻿const base = "http://127.0.0.1:9222";
+const ts = await (await fetch(`${base}/json`)).json();
+const p = ts.find(t => t.type === "page" && !t.url.startsWith("devtools://"));
+const ws = new WebSocket(p.webSocketDebuggerUrl);
+let id = 0; const pend = new Map();
+ws.onmessage = e => { const m = JSON.parse(e.data); if (m.id && pend.has(m.id)) { pend.get(m.id)(m.result); pend.delete(m.id); } };
+await new Promise(r => ws.onopen = r);
+const send = (m, params={}) => new Promise(r => { const i=++id; pend.set(i, r); ws.send(JSON.stringify({id:i, method:m, params})); });
+await send("Runtime.evaluate", { expression: `localStorage.removeItem('mc.params'); localStorage.removeItem('mc.split'); location.reload();` });
+await new Promise(r => setTimeout(r, 2000));
+console.log("cleared test values");
+ws.close();

@@ -1,0 +1,41 @@
+# ---- Rust build output ----
+rust/*/target/
+target/
+obj/
+
+# ---- Node / Tauri CLI ----
+node_modules/
+rust/mc-app/node_modules/
+
+# ---- runtime data written next to the exe ----
+.webview2/
+captures/
+*.log
+
+# ---- test artefacts and scratch output ----
+shots/
+_probe_*/
+
+# ---- packaged binaries ----
+# The portable zip and the installer are 28-29 MB each (they contain ffmpeg).
+# They belong in a GitHub Release, not in the history.
+dist/*.exe
+dist/*.zip
+dist/MouseCam-*/
+dist/_*
+
+# ---- legacy C++/ImGui prototype, kept on disk but not part of this project ----
+/src/
+/third_party/
+/build.bat
+/mousecam_debug.lnk
+
+# ---- editor / OS noise ----
+.vscode/
+.idea/
+desktop.ini
+Thumbs.db
+
+# ---- stray test dumps ----
+*.raw
+
