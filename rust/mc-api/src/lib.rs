@@ -21,6 +21,7 @@ use std::time::{Duration, Instant};
 pub struct ClipDto {
     pub dir: String,
     pub name: String,
+    pub pointer_in_master: bool,
     pub fps: i32,
     pub frames: i32,
     pub duration: f64,
@@ -364,6 +365,7 @@ fn clip_dto(dir: &PathBuf) -> Option<ClipDto> {
             .file_name()
             .map(|s| s.to_string_lossy().to_string())
             .unwrap_or_default(),
+        pointer_in_master: clip.pointer_in_master,
         fps: clip.fps,
         frames: clip.frame_count,
         duration: clip.duration,
@@ -540,28 +542,39 @@ pub fn still(dir: String, edit: String, frame: i32, max_w: u32, kind: String) ->
         rs.prep(lx, ly, rw, rh, out_w as i32, out_h as i32);
         rs.run(&src, dec_w, dec_h, &mut dst, out_w as i32);
 
-        if let Some(spr) = arrow_sprite() {
-            let smooth = mc_engine::track::smooth_track(&clip.track, s.cursor_smooth_ms);
-            if s.click_ring {
-                for (ct, cx, cy) in mc_engine::edit::click_points(&clip.track) {
-                    let age = (t - ct) / 0.45;
-                    if (0.0..=1.0).contains(&age) {
-                        let sc2 = out_w as f32 / rw as f32;
-                        mc_engine::cursor::draw_click_ring(
-                            &mut dst,
-                            out_w as i32,
-                            out_h as i32,
-                            (cx - r.x as f32) * sc2,
-                            (cy - r.y as f32) * sc2,
-                            age as f32,
-                            sc2,
-                        );
-                    }
+        let sc = out_w as f32 / (rw / k);
+        if s.click_ring {
+            for (ct, cx, cy) in mc_engine::edit::click_points(&clip.track) {
+                let age = (t - ct) / 0.45;
+                if (0.0..=1.0).contains(&age) {
+                    mc_engine::cursor::draw_click_ring(
+                        &mut dst,
+                        out_w as i32,
+                        out_h as i32,
+                        (cx - r.x as f32) * sc,
+                        (cy - r.y as f32) * sc,
+                        age as f32,
+                        sc,
+                    );
                 }
             }
-            let p = mc_engine::edit::cursor_at(&smooth, &e, t);
-            let sc = out_w as f32 / rw;
-            draw_cursor(&mut dst, out_w as i32, out_h as i32, (p.x - r.x as f32) * sc, (p.y - r.y as f32) * sc, sc, &spr);
+        }
+        // 0.2+ records the pointer into master. Older clips need it rebuilt
+        // from track.csv, because their master has no pointer to decode.
+        if !clip.pointer_in_master {
+            if let Some(spr) = arrow_sprite() {
+                let smooth = mc_engine::track::smooth_track(&clip.track, s.cursor_smooth_ms);
+                let p = mc_engine::edit::cursor_at(&smooth, &e, t);
+                draw_cursor(
+                    &mut dst,
+                    out_w as i32,
+                    out_h as i32,
+                    (p.x - r.x as f32) * sc,
+                    (p.y - r.y as f32) * sc,
+                    sc,
+                    &spr,
+                );
+            }
         }
         encode_jpeg(&dst, out_w, out_h, 84)
     } else {
