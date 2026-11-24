@@ -1966,9 +1966,11 @@ function drawTimeline() {
     }
     ctx.stroke();
 
-    // grips
+    // Grips are only draggable in 裁切 mode, so they are drawn dim otherwise:
+    // a full-strength handle that ignores the pointer reads as broken.
+    const live = state.trimMode;
     for (const x of edges.flatMap((e) => [e.a, e.b])) {
-      ctx.fillStyle = '#2ee6a8';
+      ctx.fillStyle = live ? '#2ee6a8' : 'rgba(46,230,168,.32)';
       roundRect(ctx, x - 3.5, laneY + laneH / 2 - 9, 7, 18, 3);
       ctx.fill();
     }
@@ -2192,20 +2194,8 @@ tlCanvas.addEventListener('mousedown', (ev) => {
     return;
   }
 
-  const edges = trimEdges(g);
-  for (let i = 0; i < edges.length; i++) {
-    if (Math.abs(x - edges[i].a) <= TRIM_HIT) {
-      pushUndo();
-      tlDrag = { kind: 'edge', i, which: 'a' };
-      return;
-    }
-    if (Math.abs(x - edges[i].b) <= TRIM_HIT) {
-      pushUndo();
-      tlDrag = { kind: 'edge', i, which: 'b' };
-      return;
-    }
-  }
-  // the minus badge wins over everything: it is small and sits inside the box
+  // The minus badge wins over everything: it is small and sits inside the box,
+  // and it stays live outside 变速 mode.
   {
     const y = ev.clientY - r.top;
     const laneY = 26;
@@ -2214,6 +2204,23 @@ tlCanvas.addEventListener('mousedown', (ev) => {
       if (!del) continue;
       if (Math.hypot(x - del.x, y - del.y) <= SPEED_DEL_R + 2) {
         deleteSpeedRegion(i);
+        return;
+      }
+    }
+  }
+  // Trim handles only respond in 裁切 mode: a stray drag on the timeline used to
+  // move a kept range after the mode was switched off.
+  if (state.trimMode) {
+    const edges = trimEdges(g);
+    for (let i = 0; i < edges.length; i++) {
+      if (Math.abs(x - edges[i].a) <= TRIM_HIT) {
+        pushUndo();
+        tlDrag = { kind: 'edge', i, which: 'a' };
+        return;
+      }
+      if (Math.abs(x - edges[i].b) <= TRIM_HIT) {
+        pushUndo();
+        tlDrag = { kind: 'edge', i, which: 'b' };
         return;
       }
     }
@@ -2300,6 +2307,8 @@ tlCanvas.addEventListener('dblclick', (ev) => {
     markTrimDirty();
     return;
   }
+  // Removing a kept range is an edit to the trim, so it too belongs to 裁切 mode.
+  if (!state.trimMode) return;
   const i = state.trims.findIndex((x) => t >= x.a && t <= x.b);
   if (i < 0) return;
   pushUndo();
