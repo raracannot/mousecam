@@ -1220,6 +1220,49 @@ function loadImg(src) {
 }
 
 /* ---------------- left viewport ---------------- */
+// Older masters contain no pointer. Reconstruct an arrow from the recorded
+// trace, using the same keyframe interval and interpolation as edit::cursor_at.
+function drawReplayCursor(ctx, box, source, growth = 1, edited = false) {
+  if (state.clip?.pointer_in_master) return;
+  const t = state.frame / (state.bake ? state.bake.fps : 30);
+  const kfs = state.kfs;
+  const track = edited && kfs.length >= 2 && t >= kfs[0].t && t <= kfs[kfs.length - 1].t
+    ? kfs.map(k => [k.t, k.x, k.y]) : state.track;
+  if (!track.length) return;
+  let lo = 0, hi = track.length - 1;
+  while (hi - lo > 1) {
+    const mid = (lo + hi) >> 1;
+    if (track[mid][0] <= t) lo = mid; else hi = mid;
+  }
+  const a = track[lo], b = track[hi];
+  const f = b[0] > a[0] ? Math.max(0, Math.min(1, (t - a[0]) / (b[0] - a[0]))) : 0;
+  const x = a[1] + (b[1] - a[1]) * f;
+  const y = a[2] + (b[2] - a[2]) * f;
+  const scale = box.w / source[2];
+  ctx.save();
+  ctx.beginPath();
+  ctx.rect(box.x, box.y, box.w, box.h);
+  ctx.clip();
+  ctx.translate(box.x + (x - source[0]) * scale, box.y + (y - source[1]) * box.h / source[3]);
+  ctx.scale(scale * growth, scale * growth);
+  ctx.beginPath();
+  ctx.moveTo(0, 0);
+  ctx.lineTo(0, 22);
+  ctx.lineTo(6, 16);
+  ctx.lineTo(10, 25);
+  ctx.lineTo(14, 23);
+  ctx.lineTo(10, 14);
+  ctx.lineTo(19, 14);
+  ctx.closePath();
+  ctx.fillStyle = '#fff';
+  ctx.strokeStyle = '#000';
+  ctx.lineWidth = 1.5;
+  ctx.lineJoin = 'round';
+  ctx.fill();
+  ctx.stroke();
+  ctx.restore();
+}
+
 function viewMapping() {
   const cv = $('viewCanvas');
   const r = cv.parentElement.getBoundingClientRect();
@@ -1317,6 +1360,8 @@ function drawLeft() {
     const grow = p[2] / base;
     $('expandInfo').textContent = grow > 1.02 ? `×${grow.toFixed(2)} 快移扩展` : '标准';
   }
+
+  drawReplayCursor(ctx, box, mon);
 
   // ---- manual keyframes
   if (state.kfs.length) {
@@ -1434,6 +1479,10 @@ function drawCropFromVideo() {
   ctx.clearRect(0, 0, w, h);
   const box = fitInside(w, h, sw, sh);
   ctx.drawImage(v, sx, sy, sw, sh, box.x, box.y, box.w, box.h);
+  const source = [mon[0] + sx / kx, mon[1] + sy / ky, sw / kx, sh / ky];
+  const rest = state.edit.width / Math.max(0.1, Math.min(8, state.edit.zoom));
+  const growth = Math.max(1, Math.min(4, source[2] / rest));
+  drawReplayCursor(ctx, box, source, growth, true);
   ctx.strokeStyle = 'rgba(255,255,255,.06)';
   ctx.lineWidth = 1;
   ctx.strokeRect(box.x + .5, box.y + .5, box.w - 1, box.h - 1);

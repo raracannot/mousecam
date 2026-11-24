@@ -10,6 +10,8 @@ use std::path::{Path, PathBuf};
 pub struct ClipInfo {
     pub dir: PathBuf,
     pub master: PathBuf,
+    /// 0.2+ paints the pointer into the master take.
+    pub pointer_in_master: bool,
     pub mon: IRect,
     pub fps: i32,
     pub frame_count: i32,
@@ -48,6 +50,12 @@ fn parse_monitor(meta: &str) -> Option<IRect> {
         json_num(block, "w")? as i32,
         json_num(block, "h")? as i32,
     ))
+}
+
+/// 0.2 added cursorSmoothMs at the same time it started recording the pointer
+/// into master. Older clips have neither and need an editor-side reconstruction.
+fn meta_has_pointer(meta: &str) -> bool {
+    meta.contains("\"cursorSmoothMs\"")
 }
 
 fn aspect_from_ratio(w: i32, h: i32) -> i32 {
@@ -173,6 +181,7 @@ pub fn load_clip(dir: &Path) -> Result<ClipInfo, String> {
     Ok(ClipInfo {
         dir: dir.to_path_buf(),
         master,
+        pointer_in_master: meta_has_pointer(&meta),
         mon,
         fps,
         frame_count,
@@ -264,4 +273,15 @@ pub fn json_f64(text: &str, key: &str, dflt: f64) -> f64 {
         .find(|c: char| c != '-' && c != '+' && c != '.' && !c.is_ascii_digit() && c != 'e' && c != 'E')
         .unwrap_or(tail.len());
     tail[..end].trim().parse::<f64>().unwrap_or(dflt)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::meta_has_pointer;
+
+    #[test]
+    fn detects_pointer_recorded_into_master() {
+        assert!(meta_has_pointer(r#"{"cursorSmoothMs": 60.0}"#));
+        assert!(!meta_has_pointer(r#"{"app":"MouseCam"}"#));
+    }
 }
