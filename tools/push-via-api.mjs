@@ -131,9 +131,12 @@ function parsePerson(s) {
   return { name, email, date: d.toISOString().replace(/\.\d{3}Z$/, 'Z') };
 }
 
-// name-status, minus the commit header; -z keeps paths with spaces intact
-function changedFiles(sha) {
-  const out = gitBuf('diff-tree', '--no-commit-id', '-r', '--name-status', '-z', sha);
+// name-status between two trees, not between a commit and its parent: a merge
+// commit has no single-parent diff, so the changes it resolved would otherwise
+// be lost and the branch would be pushed missing them.
+// -z keeps paths with spaces intact.
+function changedFiles(from, sha) {
+  const out = gitBuf('diff-tree', '--no-commit-id', '-r', '--name-status', '-z', from, sha);
   const parts = out.toString('utf8').split('\0').filter((x) => x.length);
   const rows = [];
   for (let i = 0; i < parts.length; ) {
@@ -191,13 +194,22 @@ let parentTree = (await api('GET', `/repos/${REPO}/git/commits/${parent}`)).tree
 let rewritten = 0;
 let deleted = 0;
 let created = 0;
+// local commit -> the commit the server now has for it, so a merge can point at
+// both of its parents after they have been rewritten.
+const rewrittenShas = new Map();
+let prev = head;
 
 for (const sha of commits) {
   const { message, author, committer } = readCommit(sha);
-  const rows = changedFiles(sha);
+  const rows = changedFiles(prev, sha);
   const entries = [];
 
   for (const row of rows) {
+    if (row.status.startsWith('R') || row.status.startsWith('C')) {
+      // a rename removes the old path as well as adding the new one
+      entries.push({ path: row.from, mode: '100644', type: 'blob', sha: null });
+      deleted++;
+    }
     if (row.status.startsWith('D')) {
       entries.push({ path: row.path, mode: '100644', type: 'blob', sha: null });
       deleted++;
@@ -212,13 +224,19 @@ for (const sha of commits) {
   }
 
   const tree = await api('POST', `/repos/${REPO}/git/trees`, { base_tree: parentTree, tree: entries });
+  // Every parent of the original commit, not just the first: a merge that lost
+  // its second parent is a different commit and, worse, a different tree.
+  const localParents = git('rev-list', '--parents', '-n', '1', sha).split(' ').slice(1);
+  const parents = localParents.map((p) => rewrittenShas.get(p) || p);
   const commit = await api('POST', `/repos/${REPO}/git/commits`, {
     message,
     tree: tree.sha,
-    parents: [parent],
+    parents,
     author,
     committer,
   });
+  rewrittenShas.set(sha, commit.sha);
+  prev = sha;
 
   const same = commit.sha === sha;
   if (!same) rewritten++;
