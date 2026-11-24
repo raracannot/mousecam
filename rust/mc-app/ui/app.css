@@ -605,6 +605,12 @@ select {
   color: #7ff0c6;
 }
 .chip-trim { background: rgba(46,230,168,.12); color: #7ff0c6; }
+.chip-speed { background: rgba(255,176,79,.13); color: #ffc178; white-space: nowrap; }
+#speedToggle.is-on {
+  background: rgba(255,176,79,.13);
+  border-color: rgba(255,176,79,.45);
+  color: #ffc178;
+}
 
 .vp-media {
   position: absolute;

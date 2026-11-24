@@ -635,6 +635,7 @@ pub struct EditStateDto {
     pub cs: f32,
     pub clk: i32,
     pub trims: Vec<[f64; 2]>,
+    pub speeds: Vec<[f64; 3]>,
     pub kfs: Vec<[f64; 3]>,
 }
 
@@ -649,10 +650,12 @@ pub fn load_edit(dir: String) -> Result<EditStateDto, String> {
         ("meta".to_string(), None)
     };
     let mut trims = Vec::new();
+    let mut speeds = Vec::new();
     let mut kfs = Vec::new();
     if let Some(e) = &edit {
         e.cam.apply(&mut s);
         trims = e.trims.iter().map(|t| [t.0, t.1]).collect();
+        speeds = e.speeds.iter().map(|v| [v.a, v.b, v.speed]).collect();
         kfs = e.kf.iter().map(|k| [k.t, k.x as f64, k.y as f64]).collect();
     }
     Ok(EditStateDto {
@@ -670,6 +673,7 @@ pub fn load_edit(dir: String) -> Result<EditStateDto, String> {
         cs: s.cursor_smooth_ms,
         clk: if s.click_ring { 1 } else { 0 },
         trims,
+        speeds,
         kfs,
     })
 }
@@ -750,10 +754,34 @@ pub fn export(
         .map(|e| e.to_string_lossy().to_ascii_lowercase())
         .unwrap_or_default();
     if !audio.is_empty() && ext != "gif" {
-        // one kept range: the sound starts where the picture starts
-        let at = e.trims.first().map(|t| t.0).unwrap_or(0.0);
+        // The sound follows the same timeline as the picture: every kept range
+        // is cut from its own start, and a speed region stretches that piece the
+        // way the frames were stretched. Without an edit this stays None and the
+        // plain offset path is used.
+        let segs = mc_engine::edit::kept_segments(clip.duration, &e);
+        let pieces: Option<Vec<mc_engine::ffmpeg::AudioPiece>> = if e.trims.is_empty()
+            && e.speeds.is_empty()
+        {
+            None
+        } else {
+            let mut v = Vec::new();
+            for (a, b, _) in segs {
+                for (x, y) in mc_engine::edit::split_by_speed(a, b, &e.speeds) {
+                    let speed = mc_engine::edit::speed_at(&e.speeds, (x + y) * 0.5);
+                    v.push(mc_engine::ffmpeg::AudioPiece { a: x, b: y, speed });
+                }
+            }
+            Some(v)
+        };
+        let at = if pieces.is_some() {
+            0.0
+        } else {
+            e.trims.first().map(|t| t.0).unwrap_or(0.0)
+        };
         let dur = sum.frames as f64 / s.fps as f64;
-        if let Err(err) = mc_engine::ffmpeg::mux_audio(&ff, &sum.out_path, &audio, at, Some(dur)) {
+        if let Err(err) =
+            mc_engine::ffmpeg::mux_audio(&ff, &sum.out_path, &audio, at, Some(dur), pieces.as_deref())
+        {
             mc_engine::mc_warn!("export", "封装音频失败: {err}");
         } else {
             mc_engine::mc_info!("export", "已加入 {} 条音轨，起点 {at:.3}s", audio.len());

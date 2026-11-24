@@ -115,6 +115,18 @@
         <button class="head-btn" id="btnTrimClear" title="清除裁切（或双击时间线）">清除裁切</button>
         <span class="tc tc-dim" id="trimIn" title="入点，双击可输入时间码">00:00.00</span>
         <span class="tc tc-dim" id="trimOut" title="出点，双击可输入时间码">00:00.00</span>
+        <button class="head-btn" id="speedToggle" title="开启后拖动时间线可框选加速/减速区间">变速</button>
+        <span class="chip chip-speed" id="speedChip" style="display:none">—</span>
+        <select class="sel-mini" id="speedPick" title="选中变速区间后调整速度" style="display:none">
+          <option value="0.25">0.25×</option>
+          <option value="0.5">0.5×</option>
+          <option value="1">1×</option>
+          <option value="1.5">1.5×</option>
+          <option value="2">2×</option>
+          <option value="3">3×</option>
+          <option value="4">4×</option>
+        </select>
+        <button class="head-btn" id="btnSpeedClear" title="移除所有变速区间" style="display:none">清除变速</button>
         <div class="seg seg-sm" id="tlZoom">
           <button data-z="0" class="is-active">全览</button>
           <button data-z="1">2×</button>

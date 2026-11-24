@@ -4,7 +4,10 @@
 use crate::camera::{Camera, IRect, Vec2};
 use crate::clip::ClipInfo;
 use crate::cursor::{arrow_sprite, draw, Sprite};
-use crate::edit::{build_frame_map, cursor_at, resample_map, EditList};
+use crate::edit::{
+    build_frame_map, build_speed_map, cursor_at, kept_segments, output_duration, resample_map,
+    EditList,
+};
 use crate::ffmpeg::{media_duration as _dur, FrameReader, FrameWriter, VideoFormat};
 use crate::resample::Resampler;
 use crate::settings::Settings;
@@ -178,21 +181,51 @@ pub fn render_clip(
         }
         let _ = std::fs::write(dump, txt);
     }
-    let fmap = build_frame_map(clip.frame_count, clip.fps, edit);
-    if fmap.is_empty() {
+    // Speed regions work in source time, so they need the kept ranges rather
+    // than the frame list: a range can be sped up or slowed down independently
+    // of how many source frames it holds.
+    let segs = kept_segments(clip.duration, edit);
+    if segs.is_empty() {
         return Err("编辑清单没有产生任何帧".into());
     }
+    let out_total = if edit.speeds.is_empty() {
+        None
+    } else {
+        let d = output_duration(&segs, &edit.speeds);
+        if d <= 0.0 {
+            return Err("编辑清单没有产生任何帧".into());
+        }
+        Some(d)
+    };
 
     log_line(&format!(
         "clip {}x{} @{} fps  {:.2}s  {} frames   bake {:.0} ms",
         clip.mon.w, clip.mon.h, clip.fps, clip.duration, clip.frame_count, bake_ms
     ));
+    // `fmap` holds *source* frame indices. When the export asks for a different
+    // rate, resample it: each output frame picks the source frame that was on
+    // screen at that moment. Writing one output frame per source frame at a
+    // different `-r` would change nothing but the playback speed.
+    //
+    // Speed regions take over that mapping when present: the output length then
+    // depends on how fast each stretch plays, not just on which frames survived
+    // the trims.
+    let src_of_out: Vec<i32> = if out_total.is_some() {
+        build_speed_map(clip.frame_count, clip.fps, s.fps, &segs, &edit.speeds)
+    } else {
+        resample_map(&build_frame_map(clip.frame_count, clip.fps, edit), clip.fps, s.fps)
+    };
+    if src_of_out.is_empty() {
+        return Err("编辑清单没有产生任何帧".into());
+    }
+
     log_line(&format!(
-        "edit trims={} kf={}  ->  {} out frames ({:.2}s)",
+        "edit trims={} speeds={} kf={}  ->  {} out frames ({:.2}s)",
         edit.trims.len(),
+        edit.speeds.len(),
         edit.kf.len(),
-        fmap.len(),
-        fmap.len() as f64 / s.fps as f64
+        src_of_out.len(),
+        src_of_out.len() as f64 / s.fps as f64
     ));
     log_line(&format!(
         "out  {}x{}  zoom={:.2} expand={:.2} smooth={:.0} follow={:.2}",
@@ -223,11 +256,6 @@ pub fn render_clip(
     let t0 = Instant::now();
     let mut written = 0i32;
     let mut src_cur = 0i32;
-    // `fmap` holds *source* frame indices. When the export asks for a different
-    // rate, resample it: each output frame picks the source frame that was on
-    // screen at that moment. Writing one output frame per source frame at a
-    // different `-r` would change nothing but the playback speed.
-    let src_of_out: Vec<i32> = resample_map(&fmap, clip.fps, s.fps);
     let total = src_of_out.len() as i32;
 
     for k in 0..total {

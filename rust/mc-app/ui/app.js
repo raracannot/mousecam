@@ -100,9 +100,12 @@ const state = {
   stillPending: false,
   dirty: false,
   trims: [],            // [{a, b}, ...] kept ranges; empty = whole clip
+  speeds: [],           // [{a, b, speed}, ...] speed regions, source seconds
+  speedSel: -1,         // index of the region whose slider is showing
   kfs: [],              // [{t, x, y}] manual follow points
   kfMode: false,
   trimMode: false,
+  speedMode: false,
   loop: false,
   monitor: 0,
   lastToggle: 0,
@@ -190,6 +193,7 @@ function editText() {
     `width ${e.width}`,
   ];
   for (const t of state.trims) lines.push(`trim ${t.a.toFixed(3)} ${t.b.toFixed(3)}`);
+  for (const v of state.speeds) lines.push(`speed ${v.a.toFixed(3)} ${v.b.toFixed(3)} ${v.speed.toFixed(3)}`);
   for (const k of state.kfs) lines.push(`kf ${k.t.toFixed(3)} ${Math.round(k.x)} ${Math.round(k.y)}`);
   return lines.join('\n');
 }
@@ -837,7 +841,7 @@ function buildParams(target) {
 // A snapshot of everything an edit can touch. Strings keep it trivial to
 // compare and impossible to get subtly wrong in the way per-action inverses are.
 function editState() {
-  return JSON.stringify({ trims: state.trims, kfs: state.kfs, edit: state.edit });
+  return JSON.stringify({ trims: state.trims, speeds: state.speeds, kfs: state.kfs, edit: state.edit });
 }
 
 function pushUndo() {
@@ -851,6 +855,9 @@ function pushUndo() {
 function applyEditState(json) {
   const o = JSON.parse(json);
   state.trims = o.trims || [];
+  state.speeds = o.speeds || [];
+  state.speedSel = -1;
+  syncSpeedControls();
   state.kfs = o.kfs || [];
   Object.assign(state.edit, o.edit || {});
   buildParams('paramsGrid');
@@ -893,6 +900,9 @@ function applyLoadedEdit(st) {
     clk: st.clk,
   });
   state.trims = (st.trims || []).map(([a, b]) => ({ a, b }));
+  state.speeds = (st.speeds || []).map(([a, b, speed]) => ({ a, b, speed }));
+  state.speedSel = -1;
+  syncSpeedControls();
   state.kfs = (st.kfs || []).map(([t, x, y]) => ({ t, x, y }));
   buildParams('paramsGrid');
   buildParams('recParamsGrid');
@@ -965,15 +975,51 @@ $('loopToggle').onclick = () => {
 $('trimToggle').onclick = () => {
   state.trimMode = !state.trimMode;
   $('trimToggle').classList.toggle('is-on', state.trimMode);
-  document.getElementById('tlCanvas').style.cursor = state.trimMode ? 'crosshair' : '';
+  // dragging the timeline can only mean one thing at a time
+  if (state.trimMode && state.speedMode) {
+    state.speedMode = false;
+    $('speedToggle').classList.remove('is-on');
+  }
+  document.getElementById('tlCanvas').style.cursor =
+    state.trimMode || state.speedMode ? 'crosshair' : '';
   if (state.trimMode) {
     toast('拖动框选要保留的区间；可多段，双击某段删除', 3000);
   }
+  drawTimeline();
 };
 
 $('btnTrimClear').onclick = () => {
   pushUndo();
   state.trims = [];
+  scheduleSaveEdit();
+  drawTimeline();
+  drawLeft();
+};
+
+$('speedToggle').onclick = () => {
+  state.speedMode = !state.speedMode;
+  $('speedToggle').classList.toggle('is-on', state.speedMode);
+  // the two modes own the same drag gesture, so only one can be armed
+  if (state.speedMode && state.trimMode) {
+    state.trimMode = false;
+    $('trimToggle').classList.remove('is-on');
+  }
+  const cv = document.getElementById('tlCanvas');
+  cv.style.cursor = state.speedMode ? 'crosshair' : state.trimMode ? 'crosshair' : '';
+  if (state.speedMode) {
+    toast('拖动框选变速区间，再用速度下拉调整；双击某段删除', 3400);
+  }
+  drawTimeline();
+};
+
+$('speedPick').onchange = (e) => setSpeed(Number(e.target.value));
+
+$('btnSpeedClear').onclick = () => {
+  if (!state.speeds.length) return;
+  pushUndo();
+  state.speeds = [];
+  state.speedSel = -1;
+  syncSpeedControls();
   scheduleSaveEdit();
   drawTimeline();
   drawLeft();
@@ -1106,6 +1152,9 @@ async function selectClip(dir) {
   // The take carries its own edit (`edit.mcl`), which is also what mc-render
   // reads; meta.json is the fallback for a clip that was never edited.
   state.trims = [];
+  state.speeds = [];
+  state.speedSel = -1;
+  syncSpeedControls();
   state.kfs = [];
   try {
     const st = await invoke('load_edit', { dir: c.dir });
@@ -1634,6 +1683,116 @@ function trimTotal() {
   return state.trims.reduce((sum, t) => sum + Math.max(0, t.b - t.a), 0);
 }
 
+/* ---------------- speed regions ---------------- */
+const SPEED_MIN = 0.25;
+const SPEED_MAX = 4;
+
+// Pixel edges for every speed region, in the same order as `state.speeds`.
+function speedEdges(g) {
+  return state.speeds.map((v) => ({ a: timeToX(g, v.a), b: timeToX(g, v.b) }));
+}
+
+// Sorted, inside the clip and free of overlaps, so the engine sees a sane list.
+// The newer region keeps its span and takes over from where the older one ends.
+function normalizeSpeeds() {
+  const dur = state.clip ? state.clip.duration : Infinity;
+  const fps = state.bake ? state.bake.fps : 30;
+  const minGap = 3 / fps;
+  const list = state.speeds
+    .map((v) => ({
+      a: Math.max(0, Math.min(v.a, v.b)),
+      b: Math.min(dur, Math.max(v.a, v.b)),
+      speed: Math.max(SPEED_MIN, Math.min(SPEED_MAX, Number(v.speed) || 1)),
+    }))
+    .filter((v) => v.b - v.a >= minGap)
+    .sort((x, y) => x.a - y.a);
+  const merged = [];
+  for (const v of list) {
+    const last = merged[merged.length - 1];
+    if (last && v.a < last.b - 1e-6) {
+      if (v.b > last.b) merged.push({ a: last.b, b: v.b, speed: v.speed });
+    } else {
+      merged.push(v);
+    }
+  }
+  state.speeds = merged;
+  if (state.speedSel >= merged.length) state.speedSel = merged.length - 1;
+}
+
+function speedTotal() {
+  return state.speeds.reduce((sum, v) => sum + Math.max(0, v.b - v.a), 0);
+}
+
+// Mirrors edit::source_time_at: where an output second lands on the source.
+function speedDuration() {
+  const dur = state.clip ? state.clip.duration : 0;
+  const segs = state.trims.length
+    ? state.trims.map((t) => ({ a: t.a, b: t.b }))
+    : [{ a: 0, b: dur }];
+  const fps = state.bake ? state.bake.fps : 30;
+  const at = (t) => {
+    for (const v of state.speeds) if (t >= v.a && t < v.b) return v.speed;
+    return 1;
+  };
+  let total = 0;
+  for (const s of segs) {
+    if (s.b <= s.a) continue;
+    const cuts = [s.a];
+    for (const v of state.speeds) {
+      if (v.a > s.a && v.a < s.b) cuts.push(v.a);
+      if (v.b > s.a && v.b < s.b) cuts.push(v.b);
+    }
+    cuts.push(s.b);
+    cuts.sort((x, y) => x - y);
+    for (let i = 0; i < cuts.length - 1; i++) {
+      const x = cuts[i], y = cuts[i + 1];
+      if (y - x < 1 / fps) continue;
+      total += (y - x) / at((x + y) / 2);
+    }
+  }
+  return total;
+}
+
+// Shows or hides the per-region speed picker and the summary chip.
+function syncSpeedControls() {
+  const chip = $('speedChip');
+  const pick = $('speedPick');
+  const clear = $('btnSpeedClear');
+  const any = state.speeds.length > 0;
+  if (chip) {
+    chip.style.display = any ? '' : 'none';
+    if (any) {
+      const n = state.speeds.length;
+      chip.textContent = `变速 ${n} 段 · 成片 ${tc(speedDuration())}`;
+    }
+  }
+  if (clear) clear.style.display = any ? '' : 'none';
+  if (pick) {
+    const sel = state.speeds[state.speedSel];
+    pick.style.display = sel ? '' : 'none';
+    if (sel) pick.value = String(sel.speed);
+  }
+}
+
+// Applies a speed to the selected region (or to the one under the playhead).
+function setSpeed(v) {
+  const i = state.speedSel >= 0 ? state.speedSel : speedUnderPlayhead();
+  if (i < 0) return;
+  pushUndo();
+  state.speeds[i].speed = Math.max(SPEED_MIN, Math.min(SPEED_MAX, v));
+  state.speedSel = i;
+  syncSpeedControls();
+  drawTimeline();
+  drawLeft();
+  markTrimDirty();
+}
+
+function speedUnderPlayhead() {
+  const fps = state.bake ? state.bake.fps : 30;
+  const t = state.frame / fps;
+  return state.speeds.findIndex((v) => t >= v.a && t <= v.b);
+}
+
 function drawTimeline() {
   const g = tlGeom();
   const { ctx, w, h } = g;
@@ -1732,6 +1891,43 @@ function drawTimeline() {
     }
   }
 
+  // ---- speed regions (drawn above the trim tint, below the playhead)
+  const se = speedEdges(g);
+  if (se.length) {
+    ctx.save();
+    for (let i = 0; i < se.length; i++) {
+      const speed = state.speeds[i].speed;
+      const fast = speed >= 1;
+      const heat = Math.min(1, Math.abs(Math.log2(speed)) / 2);
+      const w = Math.max(1, se[i].b - se[i].a);
+      const sel = i === state.speedSel;
+      const hue = fast ? '255,176,79' : '120,180,255';
+      ctx.fillStyle = `rgba(${hue},${0.10 + 0.16 * heat})`;
+      ctx.fillRect(se[i].a, laneY, w, laneH);
+
+      if (sel) {
+        // a soft halo so the selected region reads at a glance
+        ctx.strokeStyle = `rgba(${hue},.30)`;
+        ctx.lineWidth = 6;
+        ctx.strokeRect(se[i].a - 1, laneY + .5, w + 2, laneH - 1);
+      }
+      ctx.strokeStyle = `rgba(${hue},${sel ? 1 : 0.7})`;
+      ctx.lineWidth = sel ? 2 : 1.4;
+      ctx.strokeRect(se[i].a + .5, laneY + .5, w - 1, laneH - 1);
+
+      // the factor, when the span is wide enough to hold the label
+      if (se[i].b - se[i].a > 34) {
+        ctx.font = '10px "Segoe UI", system-ui, sans-serif';
+        ctx.fillStyle = fast ? 'rgba(255,205,150,.95)' : 'rgba(185,215,255,.95)';
+        ctx.textBaseline = 'middle';
+        ctx.textAlign = 'center';
+        ctx.fillText(`${speed}×`, (se[i].a + se[i].b) / 2, laneY + laneH - 10);
+        ctx.textAlign = 'start';
+      }
+    }
+    ctx.restore();
+  }
+
   // ---- playhead
   const px = timeToX(g, state.frame / (state.bake ? state.bake.fps : 30));
   ctx.strokeStyle = '#4f8cff';
@@ -1783,6 +1979,7 @@ function drawTimeline() {
       tcEl.style.display = 'none';
     }
   }
+  syncSpeedControls();
 }
 
 // Binning the whole track on every redraw is O(n) - with a long recording
@@ -1906,6 +2103,29 @@ tlCanvas.addEventListener('mousedown', (ev) => {
       return;
     }
   }
+  if (state.speedMode) {
+    // grab the region under the pointer to select it, otherwise start a new one
+    const se = speedEdges(g);
+    for (let i = 0; i < se.length; i++) {
+      if (x >= se[i].a - 4 && x <= se[i].b + 4) {
+        state.speedSel = i;
+        pushUndo();
+        tlDrag = { kind: 'speedEdge', i, which: x - se[i].a < se[i].b - x ? 'a' : 'b' };
+        tlDragAnchor = xToTime(g, x);
+        syncSpeedControls();
+        drawTimeline();
+        return;
+      }
+    }
+    pushUndo();
+    const t = snapTime(xToTime(g, x));
+    state.speeds.push({ a: t, b: t, speed: 2 });
+    state.speedSel = state.speeds.length - 1;
+    tlDrag = { kind: 'speedNew', i: state.speeds.length - 1 };
+    tlDragAnchor = t;
+    drawTimeline();
+    return;
+  }
   if (state.trimMode) {
     pushUndo();
     const t = snapTime(xToTime(g, x));
@@ -1914,6 +2134,19 @@ tlCanvas.addEventListener('mousedown', (ev) => {
     tlDragAnchor = t;
     drawTimeline();
     return;
+  }
+  // clicking a speed region selects it, so its factor can be changed without
+  // entering 变速 mode
+  {
+    const se = speedEdges(g);
+    for (let i = 0; i < se.length; i++) {
+      if (x >= se[i].a && x <= se[i].b) {
+        state.speedSel = i;
+        syncSpeedControls();
+        drawTimeline();
+        break;
+      }
+    }
   }
   tlDrag = { kind: 'seek' };
   seekTo(x);
@@ -1938,6 +2171,20 @@ tlCanvas.addEventListener('wheel', (ev) => {
 tlCanvas.addEventListener('dblclick', (ev) => {
   const r = tlCanvas.getBoundingClientRect();
   const t = xToTime(tlGeom(), ev.clientX - r.left);
+  // in 变速 mode a double-click removes the speed region under the pointer
+  if (state.speedMode) {
+    const vi = state.speeds.findIndex((x) => t >= x.a && t <= x.b);
+    if (vi < 0) return;
+    pushUndo();
+    state.speeds.splice(vi, 1);
+    state.speedSel = -1;
+    normalizeSpeeds();
+    syncSpeedControls();
+    drawTimeline();
+    drawLeft();
+    markTrimDirty();
+    return;
+  }
   const i = state.trims.findIndex((x) => t >= x.a && t <= x.b);
   if (i < 0) return;
   pushUndo();
@@ -1981,6 +2228,25 @@ window.addEventListener('mousemove', (ev) => {
     return;
   }
 
+  if (tlDrag.kind === 'speedNew' || tlDrag.kind === 'speedEdge') {
+    const region = state.speeds[tlDrag.i];
+    if (!region) return;
+    const snapped = snapTime(t);
+    if (tlDrag.kind === 'speedNew') {
+      const ta = snapTime(tlDragAnchor);
+      region.a = Math.min(ta, snapped);
+      region.b = Math.max(ta, snapped);
+    } else if (tlDrag.which === 'a') {
+      region.a = Math.min(Math.max(0, snapped), region.b - minGap);
+    } else {
+      region.b = Math.max(Math.min(g.dur, snapped), region.a + minGap);
+    }
+    state.dragHint = { t: snapped };
+    drawTimeline();
+    drawLeft();
+    return;
+  }
+
   const range = state.trims[tlDrag.i];
   if (!range) return;
   const snapped = snapTime(t);
@@ -2008,6 +2274,21 @@ window.addEventListener('mouseup', () => {
     markTrimDirty();
   } else if (tlDrag && tlDrag.kind === 'edge') {
     normalizeTrims();
+    drawTimeline();
+    drawLeft();
+    markTrimDirty();
+  } else if (tlDrag && tlDrag.kind === 'speedNew') {
+    const fps = state.bake ? state.bake.fps : 30;
+    const region = state.speeds[tlDrag.i];
+    if (region && region.b - region.a < 3 / fps) state.speeds.splice(tlDrag.i, 1);
+    normalizeSpeeds();
+    syncSpeedControls();
+    drawTimeline();
+    drawLeft();
+    markTrimDirty();
+  } else if (tlDrag && tlDrag.kind === 'speedEdge') {
+    normalizeSpeeds();
+    syncSpeedControls();
     drawTimeline();
     drawLeft();
     markTrimDirty();

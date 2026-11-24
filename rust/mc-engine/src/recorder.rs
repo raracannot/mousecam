@@ -824,7 +824,7 @@ fn run(
         let ff = ffmpeg.clone();
         for name in ["master.mp4", "camera.mp4"] {
             let video = out_dir.join(name);
-            match crate::ffmpeg::mux_audio(&ff, &video, &usable, 0.0, None) {
+            match crate::ffmpeg::mux_audio(&ff, &video, &usable, 0.0, None, None) {
                 Ok(()) => crate::mc_info!("audio", "{name} 已加入 {} 条音轨", usable.len()),
                 Err(e) => {
                     crate::mc_warn!("audio", "{name} 封装音频失败: {e}");

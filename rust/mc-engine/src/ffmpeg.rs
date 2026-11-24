@@ -350,6 +350,14 @@ impl Drop for FrameReader {
     }
 }
 
+/// One stretch of the soundtrack: source seconds `[a, b)` play at `speed`.
+#[derive(Clone, Copy, Debug)]
+pub struct AudioPiece {
+    pub a: f64,
+    pub b: f64,
+    pub speed: f64,
+}
+
 /// Reads `Duration: HH:MM:SS.ss` out of ffmpeg's banner.
 /// Muxes WAV tracks into an already-encoded video, replacing it in place.
 ///
@@ -357,12 +365,17 @@ impl Drop for FrameReader {
 /// belongs to the frames it kept rather than the sound of the whole take. `dur`
 /// caps the result: the picture is the authority on length, and the audio is
 /// padded to reach it instead of cutting the video short.
+///
+/// `pieces` is the edit's source timeline: consecutive `[a, b)` spans with a
+/// playback `speed`, already trimmed and speed-adjusted. When it is `None` the
+/// whole track from `at` is used unchanged, which is the untrimmed case.
 pub fn mux_audio(
     ffmpeg: &Path,
     video: &Path,
     tracks: &[std::path::PathBuf],
     at: f64,
     dur: Option<f64>,
+    pieces: Option<&[AudioPiece]>,
 ) -> Result<(), String> {
     if tracks.is_empty() || !video.exists() {
         return Ok(());
@@ -378,14 +391,22 @@ pub fn mux_audio(
     let mut cmd = Command::new(ffmpeg);
     cmd.arg("-y").arg("-hide_banner").arg("-loglevel").arg("error");
     cmd.arg("-i").arg(video);
+    // With an edit timeline every track is read from the top and cut by the
+    // filter graph, because a source offset per track cannot express several
+    // disjoint kept ranges.
+    let per_piece = pieces.is_some();
     for t in tracks {
-        if at > 0.0005 {
+        if at > 0.0005 && !per_piece {
             cmd.arg("-ss").arg(format!("{at:.3}"));
         }
         cmd.arg("-i").arg(t);
     }
     cmd.arg("-map").arg("0:v:0");
-    if tracks.len() == 1 {
+    let graph_has_apad = pieces.filter(|l| !l.is_empty()).is_none();
+    if let Some(list) = pieces.filter(|l| !l.is_empty()) {
+        cmd.arg("-filter_complex").arg(audio_graph(tracks.len(), list));
+        cmd.arg("-map").arg("[out]");
+    } else if tracks.len() == 1 {
         cmd.arg("-map").arg("1:a:0").arg("-af").arg("apad");
     } else {
         let graph = format!(
@@ -402,7 +423,12 @@ pub fn mux_audio(
             cmd.arg("-t").arg(format!("{d:.3}"));
         }
     }
-    cmd.arg("-shortest");
+    // The built-in paths keep -shortest: their audio can be longer than the
+    // picture and must not stretch the file. With an edit graph the picture and
+    // the soundtrack share one timeline and -t already fixes the length.
+    if graph_has_apad {
+        cmd.arg("-shortest");
+    }
     if ext == "mp4" || ext == "mov" {
         cmd.arg("-movflags").arg("+faststart");
     }
@@ -425,6 +451,70 @@ pub fn mux_audio(
         return Err("替换成片失败：无法删除原文件".into());
     }
     std::fs::rename(&tmp, video).map_err(|e| format!("替换成片失败: {e}"))
+}
+
+/// `atempo` only accepts one factor per filter, so a 4× stretch needs two
+/// stages of 2×. Anything outside [0.5, 2.0] is split until it fits.
+fn atempo_chain(mut speed: f64) -> Vec<f64> {
+    let mut out = Vec::new();
+    while speed > 2.0 {
+        out.push(2.0);
+        speed /= 2.0;
+    }
+    while speed < 0.5 {
+        out.push(0.5);
+        speed /= 0.5;
+    }
+    out.push(speed);
+    out
+}
+
+/// The soundtrack for an edited timeline: every piece is cut out of its source
+/// track, played at its speed and laid back-to-back, so picture and sound stay
+/// in sync through speed changes and trims.
+///
+/// One graph serves every track: the pieces are mixed per track first, then
+/// concatenated in timeline order.
+fn audio_graph(tracks: usize, pieces: &[AudioPiece]) -> String {
+    let mut g = String::new();
+    for (ti, _) in (0..tracks).enumerate() {
+        let src = ti + 1; // input 0 is the video
+        let mut labels = Vec::with_capacity(pieces.len());
+        for (pi, p) in pieces.iter().enumerate() {
+            let label = format!("a{ti}_{pi}");
+            let mut chain = format!(
+                "[{src}:a]atrim=start={a:.4}:end={b:.4},asetpts=PTS-STARTPTS",
+                a = p.a,
+                b = p.b
+            );
+            for factor in atempo_chain(p.speed) {
+                chain.push_str(&format!(",atempo={factor:.6}"));
+            }
+            chain.push_str(&format!(",aformat=sample_fmts=fltp:sample_rates=48000:channel_layouts=stereo[{label}]"));
+            g.push_str(&chain);
+            g.push(';');
+            labels.push(label);
+        }
+        if labels.len() == 1 {
+            g.push_str(&format!("[{}]anull[a{}];", labels[0], ti));
+        } else {
+            let inputs: String = labels.iter().map(|l| format!("[{l}]")).collect();
+            g.push_str(&format!(
+                "{inputs}concat=n={n}:v=0:a=1[a{ti}];",
+                n = labels.len(),
+                ti = ti
+            ));
+        }
+    }
+    let all: String = (0..tracks).map(|i| format!("[a{i}]")).collect();
+    if tracks == 1 {
+        g.push_str(&format!("{all}anull[out]"));
+    } else {
+        g.push_str(&format!(
+            "{all}amix=inputs={tracks}:duration=longest:normalize=0[out]"
+        ));
+    }
+    g
 }
 
 pub fn media_duration(ffmpeg: &Path, file: &Path) -> f64 {
