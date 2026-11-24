@@ -1312,6 +1312,7 @@ pub fn recover_orphan_clips() -> usize {
                 "  \"app\": \"MouseCam\",\n",
                 "  \"recovered\": true,\n",
                 "  \"complete\": false,\n",
+                "  \"pointerInMaster\": 1,\n",
                 "  \"monitor\": {{\"x\": {}, \"y\": {}, \"w\": {}, \"h\": {}}},\n",
                 "  \"fps\": {},\n",
                 "  \"outWidth\": 1080,\n",

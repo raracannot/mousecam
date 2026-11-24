@@ -78,7 +78,16 @@ fn synthetic_take_is_self_describing() {
         .lines()
         .filter(|l| !l.trim().is_empty() && !l.starts_with('#'))
         .collect();
-    assert!(rows.len() > 80, "only {} track rows", rows.len());
+    // The camera ticks at 250 Hz, so a take of D seconds should carry roughly
+    // 250*D rows. Asserting a fixed count made this fail on a busy machine,
+    // where the recorder's first frames take longer to come out.
+    let want = (clip.duration * 100.0) as usize;
+    assert!(
+        rows.len() > want,
+        "only {} track rows for a {:.2}s take (expected > {want})",
+        rows.len(),
+        clip.duration
+    );
     let last_t: f64 = rows
         .last()
         .and_then(|l| l.split(',').next())

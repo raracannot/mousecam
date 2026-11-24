@@ -235,6 +235,7 @@ fn meta_json(cfg: &RecorderConfig, duration: f64, frames: i64, dropped: u32) -> 
             "  \"followHz\": {:.3},\n",
             "  \"lookaheadMs\": {:.1},\n",
             "  \"deadZone\": {:.4},\n",
+            "  \"pointerInMaster\": {},\n",
             "  \"cursorSmoothMs\": {:.1},\n",
             "  \"clickRing\": {},\n",
             // duration/frames are recorded here so loaders never have to probe
@@ -260,6 +261,9 @@ fn meta_json(cfg: &RecorderConfig, duration: f64, frames: i64, dropped: u32) -> 
         s.follow_hz,
         s.lookahead_ms,
         s.dead_zone,
+        // the recorder paints the pointer into the master take; the export must
+        // not paint a second one. Explicit, not inferred from another field.
+        1,
         s.cursor_smooth_ms,
         if s.click_ring { 1 } else { 0 },
         duration,

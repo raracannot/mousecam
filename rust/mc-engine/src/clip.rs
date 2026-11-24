@@ -55,6 +55,14 @@ fn parse_monitor(meta: &str) -> Option<IRect> {
 /// 0.2 added cursorSmoothMs at the same time it started recording the pointer
 /// into master. Older clips have neither and need an editor-side reconstruction.
 fn meta_has_pointer(meta: &str) -> bool {
+    // Explicit flag first: `recover_orphan_clips` writes a minimal meta, so
+    // inferring from an unrelated field would call a recovered 0.2+ take
+    // "pointer-free" and the export would draw a second arrow on it.
+    if let Some(v) = crate::clip::json_num(meta, "pointerInMaster") {
+        return v != 0.0;
+    }
+    // Older takes predate the flag; cursorSmoothMs shipped with the same change
+    // that started painting the pointer into master.
     meta.contains("\"cursorSmoothMs\"")
 }
 
@@ -283,5 +291,14 @@ mod tests {
     fn detects_pointer_recorded_into_master() {
         assert!(meta_has_pointer(r#"{"cursorSmoothMs": 60.0}"#));
         assert!(!meta_has_pointer(r#"{"app":"MouseCam"}"#));
+    }
+
+    /// A recovered take writes a minimal meta with no cursorSmoothMs, but it is
+    /// a current take and its master does contain the pointer.
+    #[test]
+    fn explicit_flag_wins_over_inference() {
+        assert!(meta_has_pointer(r#"{"pointerInMaster": 1}"#));
+        assert!(!meta_has_pointer(r#"{"pointerInMaster": 0}"#));
+        assert!(meta_has_pointer(r#"{"pointerInMaster": 1, "recovered": true}"#));
     }
 }

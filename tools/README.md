@@ -104,6 +104,10 @@ Token 取 `GH_TOKEN` / `GITHUB_TOKEN` 环境变量，否则从 `git credential` 
 | `verify-edit.mjs` | 拖拽建裁切、跟随关键帧、代理生成、播放推进、导出弹窗与时长 |
 | `verify-recpreview.mjs` | 录制页实时预览出图、参数即时影响、录制中预览继续工作 |
 | `verify-loop.mjs` | 自动回放开关、尾帧行为 |
+| `verify-cursor.mjs` | 旧素材的预览光标插值、边界、关键帧与缩放映射（纯 node） |
+| `verify-speed.mjs` | 变速区间的重叠、夹紧、序列化与单段删除（纯 node） |
+| `verify-playback.mjs` | 预览时钟与导出时间轴一致（变速 + 裁切映射，纯 node） |
+| `verify-stillcache.mjs` | 静帧缓存：按源帧归档、单次解码、字节预算、过期结果不写入（纯 node） |
 
 ```bat
 node tools\verify.mjs 9222 shots

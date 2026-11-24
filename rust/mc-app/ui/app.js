@@ -126,6 +126,7 @@ const state = {
   // (~250 ms); replaying the same stretch would otherwise pay that again for
   // every frame. Dropped whenever the edit changes.
   stillCache: new Map(),
+  stillCacheBytes: 0,
   stillCacheKey: '',
 };
 
@@ -1208,15 +1209,14 @@ async function rebake() {
   }
 }
 
-async function fetchStill(kind, maxW) {
-  const p = invoke('still', {
+async function fetchStill(kind, maxW, frame = state.frame) {
+  return invoke('still', {
     dir: state.clip.dir,
     edit: editText(),
-    frame: state.frame,
+    frame,
     maxW,
     kind,
   });
-  return p;
 }
 
 // `t` is a SOURCE second. The master sits on that clock; the proxy is a baked
@@ -1245,19 +1245,44 @@ function stillCacheKey() {
   ].join('\n');
 }
 
+// Anything already decoding belongs to the old clip/edit, so it must not be
+// filed into the new cache when it lands.
+let stillGen = 0;
+
 function clearStillCache() {
   state.stillCache.clear();
+  state.stillCacheBytes = 0;
   state.stillCacheKey = '';
+  stillGen++;
 }
 
-const STILL_CACHE_MAX = 400;
+// The cache holds renders of SOURCE frames. `still(dir, edit, frame)` is a pure
+// function of the frame number, so that is the only key that cannot collide -
+// keying on the output clock would map several source frames onto one bucket
+// inside a speed region and hand back the wrong picture.
+function stillFrame() {
+  const last = (state.bake ? state.bake.frames : 1) - 1;
+  return Math.max(0, Math.min(state.frame, last));
+}
 
-// The cache is keyed on the OUTPUT second, not the frame: that is the clock the
-// user scrubs on, and it is the same position a replay comes back to.
-function stillBucket() {
-  const fps = state.bake ? state.bake.fps : 30;
-  const outT = srcToOut(state.frame / fps);
-  return Math.round(outT * fps);
+// A still is two decoded bitmaps, so the budget has to be in bytes: 400 entries
+// of 900 px would have been well over a gigabyte.
+const STILL_CACHE_BYTES = 96 << 20;
+
+function stillBytes(img) {
+  return (img.naturalWidth || 900) * (img.naturalHeight || 500) * 4;
+}
+
+function rememberStill(frame, entry) {
+  while (state.stillCacheBytes + entry.bytes > STILL_CACHE_BYTES && state.stillCache.size) {
+    const oldest = state.stillCache.keys().next().value;
+    const drop = state.stillCache.get(oldest);
+    state.stillCache.delete(oldest);
+    state.stillCacheBytes -= drop ? drop.bytes || 0 : 0;
+    if (state.stillCacheBytes < 0) state.stillCacheBytes = 0;
+  }
+  state.stillCache.set(frame, entry);
+  state.stillCacheBytes += entry.bytes;
 }
 
 function scheduleStill() {
@@ -1281,11 +1306,12 @@ function scheduleStill() {
     state.stillCacheKey = key;
   }
 
-  // A frame already baked for this edit draws straight from memory. A
-  // prefetched entry may carry only the crop, so a viewport that needs the
-  // full frame falls through to a fresh render instead of showing a blank.
-  const hit = state.stillCache.get(stillBucket());
+  // A frame already baked for this edit draws straight from memory, and a hit
+  // moves it to the back of the map so it is the last thing evicted.
+  const hit = state.stillCache.get(stillFrame());
   if (hit) {
+    state.stillCache.delete(stillFrame());
+    state.stillCache.set(stillFrame(), hit);
     state.viewImg = hit.view;
     state.cropImg = hit.crop;
     drawLeft();
@@ -1301,21 +1327,33 @@ function scheduleStill() {
   runStillQueue();
 }
 
-// Bakes one still and files it under its bucket. Shared by the on-demand path
-// and the prefetcher, so a frame fetched ahead of the playhead lands in the same
-// place one fetched on demand would.
-async function bakeStill(bucket) {
-  const cached = state.stillCache.get(bucket);
+// Bakes the still for one source frame. The frame is a parameter on purpose: a
+// prefetcher that rendered `state.frame` would file the current picture under
+// every neighbour key it touched.
+const stillInflight = new Map();
+
+async function bakeStill(frame) {
+  const cached = state.stillCache.get(frame);
   if (cached) return cached;
-  const [view, crop] = await Promise.all([fetchStill('view', 900), fetchStill('crop', 620)]);
-  const [vi, ci] = await Promise.all([loadImg(view), loadImg(crop)]);
-  if (state.stillCache.size >= STILL_CACHE_MAX) {
-    const oldest = state.stillCache.keys().next().value;
-    state.stillCache.delete(oldest);
-  }
-  const entry = { view: vi, crop: ci };
-  state.stillCache.set(bucket, entry);
-  return entry;
+  const running = stillInflight.get(frame);
+  if (running) return running;
+
+  const gen = stillGen;
+  const job = (async () => {
+    const [view, crop] = await Promise.all([
+      fetchStill('view', 900, frame),
+      fetchStill('crop', 620, frame),
+    ]);
+    const [vi, ci] = await Promise.all([loadImg(view), loadImg(crop)]);
+    const entry = { view: vi, crop: ci, bytes: stillBytes(vi) + stillBytes(ci) };
+    // The clip or the edit changed while this was decoding: keep the images for
+    // whoever is waiting, but do not put them in the new cache.
+    if (gen === stillGen) rememberStill(frame, entry);
+    return entry;
+  })().finally(() => stillInflight.delete(frame));
+
+  stillInflight.set(frame, job);
+  return job;
 }
 
 // Dragging the playhead asks for many frames in a row. Decoding them one at a
@@ -1324,18 +1362,21 @@ async function bakeStill(bucket) {
 //
 // The fill yields the moment the user moves the playhead again, so it can never
 // starve what the eye is waiting for.
-const PREFETCH_SPAN = 12;
+const PREFETCH_SPAN = 6;
 let prefetchToken = 0;
 
-async function prefetchAround(bucket) {
+async function prefetchAround(frame) {
   const token = ++prefetchToken;
   const lastFrame = (state.bake ? state.bake.frames : 1) - 1;
   for (let d = 1; d <= PREFETCH_SPAN; d++) {
-    if (token !== prefetchToken || state.playing || state.stillPending || !state.clip) return;
     for (const dir of [d, -d]) {
-      const f = bucket + dir;
-      if (f < 0 || f > lastFrame || state.stillCache.has(f)) continue;
-      if (token !== prefetchToken || state.playing || state.stillPending) return;
+      const f = frame + dir;
+      if (f < 0 || f > lastFrame) continue;
+      if (token !== prefetchToken || state.playing || state.stillPending || !state.clip) return;
+      // Recording is a global hotkey away; decoding 12 extra stills behind it
+      // competes with capture for CPU and disk.
+      if (state.recording || document.hidden) return;
+      if (state.stillCache.has(f)) continue;
       try {
         await bakeStill(f);
       } catch {
@@ -1349,9 +1390,8 @@ async function runStillQueue() {
   try {
     while (state.stillPending && state.clip) {
       state.stillPending = false;
-      const f = state.frame;
-      const bucket = stillBucket();
-      const cached = state.stillCache.get(bucket);
+      const f = stillFrame();
+      const cached = state.stillCache.get(f);
       if (cached) {
         state.viewImg = cached.view;
         state.cropImg = cached.crop;
@@ -1360,7 +1400,7 @@ async function runStillQueue() {
         continue;
       }
       try {
-        const entry = await bakeStill(bucket);
+        const entry = await bakeStill(f);
         if (Math.abs(f - state.frame) < 2) {
           state.viewImg = entry.view;
           state.cropImg = entry.crop;
@@ -1370,7 +1410,7 @@ async function runStillQueue() {
         // Fill the neighbourhood in the background. Awaiting it here would hold
         // the queue for seconds, so a drag during the fill would find the pane
         // frozen on a stale frame.
-        if (!state.stillPending) prefetchAround(bucket);
+        if (!state.stillPending) prefetchAround(f);
       } catch (e) {
         /* seek/decode race — ignore */
       }
@@ -1381,7 +1421,9 @@ async function runStillQueue() {
     // leave the pane blank until the next scrub.
     if (state.stillPending && state.clip) {
       state.stillInFlight = true;
-      runStillQueue();
+      // Not awaited: the caller is this function's own finally block, and a
+      // thrown error there would surface as an unhandled rejection.
+      queueMicrotask(runStillQueue);
     }
   }
 }
@@ -2606,9 +2648,15 @@ function playVideos(on) {
     const at = piece ? piece.a + Math.max(0, playOutT - piece.o) * piece.speed : playOutT;
     if (playingWithProxy()) {
       // The proxy has trims and speeds baked in: it is a timeline in its own
-      // right, so it plays straight through from output second 0.
+      // right, so it plays straight through from output second 0. The master
+      // still has to PLAY - it is the left viewport's picture - so it follows
+      // at the region's rate and is re-synced whenever it drifts.
       try { c.currentTime = playOutT; c.play().catch(() => {}); } catch {}
-      try { v.currentTime = at; } catch {}
+      try {
+        v.currentTime = at;
+        v.playbackRate = Math.min(4, Math.max(0.25, piece ? piece.speed : 1));
+        v.play().catch(() => {});
+      } catch {}
     } else {
       // No proxy: the master is the moving picture, so it plays at the region's
       // rate. tickVideo re-syncs it whenever the rate changes.
@@ -2655,9 +2703,14 @@ function tickVideo() {
     if (Math.abs(v.currentTime - srcT) > 0.20) {
       try { v.currentTime = srcT; } catch {}
     }
-  } else if (playingWithProxy() && state.useVideo && v.readyState >= 2 &&
-             Math.abs(v.currentTime - srcT) > 0.25) {
-    try { v.currentTime = srcT; } catch {}
+  } else if (playingWithProxy() && state.useVideo && v.readyState >= 2) {
+    const wantRate = Math.min(4, Math.max(0.25, piece ? piece.speed : 1));
+    if (Math.abs(v.playbackRate - wantRate) > 0.01) {
+      try { v.playbackRate = wantRate; } catch {}
+    }
+    if (Math.abs(v.currentTime - srcT) > 0.25) {
+      try { v.currentTime = srcT; } catch {}
+    }
   }
 
   drawTimeline();
@@ -2666,12 +2719,13 @@ function tickVideo() {
 
   const end = speedDuration();
   if (end > 0 && playOutT >= end - 1e-3) {
-    if (state.loop) {
-      replayFromStart();
-    } else {
+    if (!state.loop) {
       stopPlayback();
+      return;
     }
-    return;
+    // Looping resets the clock but must NOT end this chain: the next tick is
+    // what keeps the picture moving after the jump back to the start.
+    replayFromStart();
   }
   requestAnimationFrame(tickVideo);
 }
