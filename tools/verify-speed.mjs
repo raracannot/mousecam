@@ -23,10 +23,22 @@ const sandbox = {
   $: () => null,
   SPEED_MIN: 0.25,
   SPEED_MAX: 4,
-  timeToX: () => 0,
+  // 100 px per source second, so a box's width is easy to reason about
+  timeToX: (_g, t) => t * 100,
+  SPEED_DEL_R: 6,
+  SPEED_DEL_INSET: 11,
+  pushUndo: () => {},
+  normalizeSpeeds: undefined,
+  syncSpeedControls: () => {},
+  drawTimeline: () => {},
+  drawLeft: () => {},
+  markTrimDirty: () => {},
 };
 vm.createContext(sandbox);
 for (const [n, next] of [
+  ['speedEdges', 'normalizeSpeeds'],
+  ['speedDeleteSpot', 'deleteSpeedRegion'],
+  ['deleteSpeedRegion', 'normalizeSpeeds'],
   ['normalizeSpeeds', 'speedTotal'],
 ]) vm.runInContext(grab(n, next), sandbox);
 
@@ -49,4 +61,38 @@ state.speeds = [{ a: 1, b: 3.5, speed: 2 }];
 const lines = [`speed ${state.speeds[0].a.toFixed(3)} ${state.speeds[0].b.toFixed(3)} ${state.speeds[0].speed.toFixed(3)}`];
 assert.equal(lines[0], 'speed 1.000 3.500 2.000');
 
-console.log('PASS: speed regions — overlap, clamp and serialization');
+// the per-region minus badge sits inside the box, and only when it fits
+const g = {};
+{
+  const d = sandbox.speedDeleteSpot(g, 0, 26);
+  assert.equal(d.x, 111);
+  assert.equal(d.y, 37);
+}
+state.speeds = [{ a: 0, b: 0.1, speed: 2 }];      // 10 px wide: too narrow
+assert.equal(sandbox.speedDeleteSpot(g, 0, 26), null);
+state.speeds = [{ a: 0, b: 0.19, speed: 2 }];     // 19 px: still too narrow
+assert.equal(sandbox.speedDeleteSpot(g, 0, 26), null);
+state.speeds = [{ a: 0, b: 0.2, speed: 2 }];      // 20 px: just fits
+assert.notEqual(sandbox.speedDeleteSpot(g, 0, 26), null);
+
+// removing one region leaves the others, and keeps the selection sane
+state.speeds = [{ a: 0, b: 2, speed: 2 }, { a: 3, b: 5, speed: 0.5 }, { a: 6, b: 8, speed: 4 }];
+state.speedSel = 2;
+sandbox.deleteSpeedRegion(1);
+assert.equal(state.speeds.length, 2);
+assert.equal(state.speeds[0].speed, 2);
+assert.equal(state.speeds[1].speed, 4);
+assert.equal(state.speedSel, 1);
+
+// deleting the selected one clears the selection
+state.speeds = [{ a: 0, b: 2, speed: 2 }];
+state.speedSel = 0;
+sandbox.deleteSpeedRegion(0);
+assert.equal(state.speeds.length, 0);
+assert.equal(state.speedSel, -1);
+
+// out-of-range indices are ignored
+sandbox.deleteSpeedRegion(5);
+assert.equal(state.speeds.length, 0);
+
+console.log('PASS: speed regions — overlap, clamp, serialization and per-region delete');

@@ -1700,6 +1700,30 @@ function speedEdges(g) {
   return state.speeds.map((v) => ({ a: timeToX(g, v.a), b: timeToX(g, v.b) }));
 }
 
+// Where the little minus badge sits for a region, or null when the box is too
+// narrow to hold one without covering the label.
+const SPEED_DEL_R = 6;
+const SPEED_DEL_INSET = 11;
+function speedDeleteSpot(g, i, laneY) {
+  const e = speedEdges(g)[i];
+  if (!e) return null;
+  if (e.b - e.a < SPEED_DEL_INSET + SPEED_DEL_R + 3) return null;
+  return { x: e.a + SPEED_DEL_INSET, y: laneY + SPEED_DEL_INSET };
+}
+
+function deleteSpeedRegion(i) {
+  if (i < 0 || i >= state.speeds.length) return;
+  pushUndo();
+  state.speeds.splice(i, 1);
+  if (state.speedSel === i) state.speedSel = -1;
+  else if (state.speedSel > i) state.speedSel--;
+  normalizeSpeeds();
+  syncSpeedControls();
+  drawTimeline();
+  drawLeft();
+  markTrimDirty();
+}
+
 // Sorted, inside the clip and free of overlaps, so the engine sees a sane list.
 // The newer region keeps its span and takes over from where the older one ends.
 function normalizeSpeeds() {
@@ -1975,13 +1999,32 @@ function drawTimeline() {
       ctx.strokeRect(se[i].a + .5, laneY + .5, w - 1, laneH - 1);
 
       // the factor, when the span is wide enough to hold the label
-      if (se[i].b - se[i].a > 34) {
+      const del = speedDeleteSpot(g, i, laneY);
+      const labelShift = del ? SPEED_DEL_R * 2 + 2 : 0;
+      if (se[i].b - se[i].a > 34 + labelShift) {
         ctx.font = '10px "Segoe UI", system-ui, sans-serif';
         ctx.fillStyle = fast ? 'rgba(255,205,150,.95)' : 'rgba(185,215,255,.95)';
         ctx.textBaseline = 'middle';
         ctx.textAlign = 'center';
-        ctx.fillText(`${speed}×`, (se[i].a + se[i].b) / 2, laneY + laneH - 10);
+        ctx.fillText(`${speed}×`, (se[i].a + se[i].b + labelShift) / 2, laneY + laneH - 10);
         ctx.textAlign = 'start';
+      }
+
+      // per-region remove button: 清除变速 still drops them all, this drops one
+      if (del) {
+        ctx.beginPath();
+        ctx.arc(del.x, del.y, SPEED_DEL_R, 0, Math.PI * 2);
+        ctx.fillStyle = sel ? `rgba(${hue},.95)` : 'rgba(12,16,22,.72)';
+        ctx.fill();
+        ctx.strokeStyle = sel ? 'rgba(12,16,22,.55)' : `rgba(${hue},.85)`;
+        ctx.lineWidth = 1.2;
+        ctx.stroke();
+        ctx.strokeStyle = sel ? '#0a0d12' : `rgba(${hue},1)`;
+        ctx.lineWidth = 1.6;
+        ctx.beginPath();
+        ctx.moveTo(del.x - 2.6, del.y);
+        ctx.lineTo(del.x + 2.6, del.y);
+        ctx.stroke();
       }
     }
     ctx.restore();
@@ -2160,6 +2203,19 @@ tlCanvas.addEventListener('mousedown', (ev) => {
       pushUndo();
       tlDrag = { kind: 'edge', i, which: 'b' };
       return;
+    }
+  }
+  // the minus badge wins over everything: it is small and sits inside the box
+  {
+    const y = ev.clientY - r.top;
+    const laneY = 26;
+    for (let i = 0; i < state.speeds.length; i++) {
+      const del = speedDeleteSpot(g, i, laneY);
+      if (!del) continue;
+      if (Math.hypot(x - del.x, y - del.y) <= SPEED_DEL_R + 2) {
+        deleteSpeedRegion(i);
+        return;
+      }
     }
   }
   if (state.speedMode) {
