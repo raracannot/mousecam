@@ -1213,11 +1213,19 @@ async function fetchStill(kind, maxW) {
   return p;
 }
 
+// `t` is a SOURCE second. The master sits on that clock; the proxy is a baked
+// timeline in OUTPUT seconds, so it needs the matching output position - passing
+// the source second to both is what made a sped-up proxy show the wrong frame.
 function seekVideos(t) {
-  for (const el of [$('viewVideo'), $('cropVideo')]) {
-    if (!el.classList.contains('is-on')) continue;
-    if (Math.abs(el.currentTime - t) > 0.02) {
-      try { el.currentTime = t; } catch {}
+  const v = $('viewVideo');
+  const c = $('cropVideo');
+  if (v.classList.contains('is-on') && Math.abs(v.currentTime - t) > 0.02) {
+    try { v.currentTime = t; } catch {}
+  }
+  if (c.classList.contains('is-on') && playingWithProxy()) {
+    const o = srcToOut(t);
+    if (Math.abs(c.currentTime - o) > 0.02) {
+      try { c.currentTime = o; } catch {}
     }
   }
 }
@@ -1723,19 +1731,28 @@ function speedTotal() {
   return state.speeds.reduce((sum, v) => sum + Math.max(0, v.b - v.a), 0);
 }
 
-// Mirrors edit::source_time_at: where an output second lands on the source.
-function speedDuration() {
+// Plain speed at a source second, regions assumed non-overlapping.
+function speedRate(t) {
+  for (const v of state.speeds) if (t >= v.a && t < v.b) return v.speed;
+  return 1;
+}
+
+// Kept ranges in source seconds, in play order.
+function keptSegs() {
   const dur = state.clip ? state.clip.duration : 0;
-  const segs = state.trims.length
+  return state.trims.length
     ? state.trims.map((t) => ({ a: t.a, b: t.b }))
     : [{ a: 0, b: dur }];
+}
+
+// Every stretch of the timeline with one constant speed, as
+// {o: output start, a, b: source span, speed}. Both the preview clock and the
+// duration estimate walk this, so they cannot drift apart.
+function timelinePieces() {
   const fps = state.bake ? state.bake.fps : 30;
-  const at = (t) => {
-    for (const v of state.speeds) if (t >= v.a && t < v.b) return v.speed;
-    return 1;
-  };
-  let total = 0;
-  for (const s of segs) {
+  const pieces = [];
+  let o = 0;
+  for (const s of keptSegs()) {
     if (s.b <= s.a) continue;
     const cuts = [s.a];
     for (const v of state.speeds) {
@@ -1747,11 +1764,53 @@ function speedDuration() {
     for (let i = 0; i < cuts.length - 1; i++) {
       const x = cuts[i], y = cuts[i + 1];
       if (y - x < 1 / fps) continue;
-      total += (y - x) / at((x + y) / 2);
+      const speed = speedRate((x + y) / 2);
+      pieces.push({ o, a: x, b: y, speed });
+      o += (y - x) / speed;
     }
   }
-  return total;
+  return pieces;
 }
+
+// Mirrors edit::source_time_at: where an output second lands on the source.
+function speedDuration() {
+  const p = timelinePieces();
+  return p.length ? p[p.length - 1].o + (p[p.length - 1].b - p[p.length - 1].a) / p[p.length - 1].speed : 0;
+}
+
+// Output second -> source second, and back. These are what make the preview
+// play at the speed the export will use.
+function outToSrc(outT) {
+  const p = timelinePieces();
+  if (!p.length) return outT;
+  for (const q of p) {
+    const len = (q.b - q.a) / q.speed;
+    if (outT < q.o + len || q === p[p.length - 1]) {
+      return Math.min(q.b, Math.max(q.a, q.a + Math.max(0, outT - q.o) * q.speed));
+    }
+  }
+  return p[p.length - 1].b;
+}
+
+// Source second -> output second. Used when the clock is the raw video's own
+// currentTime (no proxy to bake the speed into).
+function srcToOut(srcT) {
+  const p = timelinePieces();
+  if (!p.length) return srcT;
+  for (const q of p) {
+    if (srcT < q.b || q === p[p.length - 1]) {
+      return q.o + Math.max(0, Math.min(srcT, q.b) - q.a) / q.speed;
+    }
+  }
+  const q = p[p.length - 1];
+  return q.o + (q.b - q.a) / q.speed;
+}
+
+// The baked proxy already carries trims and speeds; the raw master does not.
+function playingWithProxy() {
+  return state.proxyReady && !state.proxyStale;
+}
+
 
 // Shows or hides the per-region speed picker and the summary chip.
 function syncSpeedControls() {
@@ -2303,6 +2362,11 @@ window.addEventListener('mouseup', () => {
 let trimTimer = 0;
 function markTrimDirty() {
   scheduleSaveEdit();
+  // Trims AND speed regions change what the baked proxy should show, so it has
+  // to be rebuilt; otherwise the right viewport keeps playing the old timeline.
+  state.proxyStale = true;
+  const pb = $('btnProxy');
+  if (pb) pb.classList.add('is-on');
   clearTimeout(trimTimer);
   trimTimer = setTimeout(() => {
     const dur = state.clip ? state.clip.duration : 0;
@@ -2326,36 +2390,104 @@ document.querySelectorAll('#tlZoom button').forEach((b) => {
 });
 
 /* ---------------- playback ---------------- */
+// The playhead and the timeline are both on the SOURCE clock: `state.frame` is a
+// source frame and the ruler shows source seconds. Speed regions change how fast
+// we walk that clock, not where the playhead sits. So playback advances a virtual
+// output clock and maps it back onto source time every tick.
 let playTimer = 0;
+let playOutT = 0;
+let playOutStart = 0;
+let playOutAtStart = 0;
+
+// The `speed` of the piece an output second falls in, 1 outside every region.
+function pieceAt(outT) {
+  const p = timelinePieces();
+  if (!p.length) return null;
+  for (const q of p) {
+    if (outT < q.o + (q.b - q.a) / q.speed) return q;
+  }
+  return p[p.length - 1];
+}
+
 function playVideos(on) {
+  const v = $('viewVideo');
+  const c = $('cropVideo');
   const fps = state.bake ? state.bake.fps : 30;
   if (on) {
-    seekVideos(state.frame / fps);
-    for (const el of [$('viewVideo'), $('cropVideo')]) {
-      if (el.classList.contains('is-on')) el.play().catch(() => {});
+    // Where in the output timeline the playhead currently is.
+    playOutAtStart = srcToOut(state.frame / fps);
+    playOutT = playOutAtStart;
+    playOutStart = performance.now();
+    const piece = pieceAt(playOutT);
+    const at = piece ? piece.a + Math.max(0, playOutT - piece.o) * piece.speed : playOutT;
+    if (playingWithProxy()) {
+      // The proxy has trims and speeds baked in: it is a timeline in its own
+      // right, so it plays straight through from output second 0.
+      try { c.currentTime = playOutT; c.play().catch(() => {}); } catch {}
+      try { v.currentTime = at; } catch {}
+    } else {
+      // No proxy: the master is the moving picture, so it plays at the region's
+      // rate. tickVideo re-syncs it whenever the rate changes.
+      try {
+        v.currentTime = at;
+        v.playbackRate = Math.min(4, Math.max(0.25, piece ? piece.speed : 1));
+        v.play().catch(() => {});
+      } catch {}
     }
   } else {
-    for (const el of [$('viewVideo'), $('cropVideo')]) {
+    for (const el of [v, c]) {
       try { el.pause(); } catch {}
     }
+    try { v.playbackRate = 1; } catch {}
   }
 }
 
 function tickVideo() {
   if (!state.playing) return;
-  const v = $('viewVideo');
   const fps = state.bake ? state.bake.fps : 30;
-  if (state.useVideo && v.readyState >= 2) {
-    const last = (state.bake ? state.bake.frames : 1) - 1;
-    state.frame = Math.max(0, Math.min(last, Math.round(v.currentTime * fps)));
-    drawTimeline();
-    drawLeft();
-    if (!(state.proxyReady && !state.proxyStale)) drawRight();
-    const c = $('cropVideo');
-    if (state.proxyReady && !state.proxyStale && c.readyState >= 2 &&
-        Math.abs(c.currentTime - v.currentTime) > 0.08) {
-      try { c.currentTime = v.currentTime; } catch {}
+  const last = (state.bake ? state.bake.frames : 1) - 1;
+  const v = $('viewVideo');
+  const c = $('cropVideo');
+
+  // Advance the output clock. With a proxy the element is authoritative (it is
+  // the baked timeline); otherwise wall time drives it and the master follows.
+  if (playingWithProxy() && c.readyState >= 2) {
+    playOutT = c.currentTime;
+  } else {
+    playOutT = playOutAtStart + (performance.now() - playOutStart) / 1000;
+  }
+
+  const piece = pieceAt(playOutT);
+  const srcT = piece ? piece.a + Math.max(0, playOutT - piece.o) * piece.speed : playOutT;
+  state.frame = Math.max(0, Math.min(last, Math.round(srcT * fps)));
+
+  if (!playingWithProxy() && state.useVideo && v.readyState >= 2) {
+    // keep the picture on the playhead and on the right rate, so a region
+    // boundary mid-play does not stutter or play at the old speed
+    const want = piece ? piece.speed : 1;
+    if (Math.abs(v.playbackRate - want) > 1e-3) {
+      try { v.playbackRate = Math.min(4, Math.max(0.25, want)); } catch {}
     }
+    if (Math.abs(v.currentTime - srcT) > 0.20) {
+      try { v.currentTime = srcT; } catch {}
+    }
+  } else if (playingWithProxy() && state.useVideo && v.readyState >= 2 &&
+             Math.abs(v.currentTime - srcT) > 0.25) {
+    try { v.currentTime = srcT; } catch {}
+  }
+
+  drawTimeline();
+  drawLeft();
+  if (!playingWithProxy()) drawRight();
+
+  const end = speedDuration();
+  if (end > 0 && playOutT >= end - 1e-3) {
+    if (state.loop) {
+      replayFromStart();
+    } else {
+      stopPlayback();
+    }
+    return;
   }
   requestAnimationFrame(tickVideo);
 }
@@ -2366,6 +2498,10 @@ function stopPlayback() {
   $('icoPause').style.display = 'none';
   clearInterval(playTimer);
   playVideos(false);
+  // Leave the preview parked on the frame under the playhead, so resuming or
+  // scrubbing does not jump back to wherever the master happened to stop.
+  const fps = state.bake ? state.bake.fps : 30;
+  if (state.useVideo) seekVideos(state.frame / fps);
 }
 
 function startPlayback() {
@@ -2379,15 +2515,16 @@ function startPlayback() {
     tickVideo();
     return;
   }
-  // fallback: no video available, drive stills on a timer
+  // fallback: no video available, drive stills on a timer - on the output clock,
+  // so speed regions still change the pace of the preview
   const fps = state.bake ? state.bake.fps : 30;
-  const start = performance.now();
-  const startFrame = state.frame;
+  const last = (state.bake ? state.bake.frames : 1) - 1;
   playTimer = setInterval(() => {
-    const dt = (performance.now() - start) / 1000;
-    const f = Math.round(startFrame + dt * fps);
-    const last = (state.bake ? state.bake.frames : 1) - 1;
-    if (f >= last) {
+    playOutT = playOutAtStart + (performance.now() - playOutStart) / 1000;
+    const piece = pieceAt(playOutT);
+    const srcT = piece ? piece.a + Math.max(0, playOutT - piece.o) * piece.speed : playOutT;
+    const end = speedDuration() || (state.clip ? state.clip.duration : 0);
+    if (playOutT >= end - 1e-3) {
       state.frame = last;
       drawTimeline();
       drawLeft();
@@ -2395,7 +2532,7 @@ function startPlayback() {
       onPlaybackEnd();
       return;
     }
-    state.frame = f;
+    state.frame = Math.max(0, Math.min(last, Math.round(srcT * fps)));
     drawTimeline();
     drawLeft();
     scheduleStill();
@@ -2408,11 +2545,15 @@ let lastRestart = 0;
 // Rewind to the first frame without leaving the playing state.
 function replayFromStart() {
   lastRestart = performance.now();
-  state.frame = 0;
+  const src0 = outToSrc(0);
+  state.frame = Math.round(src0 * (state.bake ? state.bake.fps : 30));
+  playOutAtStart = 0;
+  playOutT = 0;
+  playOutStart = performance.now();
   for (const el of [$('viewVideo'), $('cropVideo')]) {
     if (!el.classList.contains('is-on')) continue;
     try {
-      el.currentTime = 0;
+      el.currentTime = el === $('cropVideo') ? 0 : src0;
       if (state.playing) el.play().catch(() => {});
     } catch {}
   }

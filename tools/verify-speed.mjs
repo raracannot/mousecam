@@ -1,4 +1,5 @@
-// Speed regions: source-time math and the edit-line round trip.
+// Speed regions: normalization and the edit-line round trip.
+// The source-time mapping itself is covered by verify-playback.mjs.
 // Runs without the app: node tools/verify-speed.mjs
 import assert from 'node:assert/strict';
 import fs from 'node:fs';
@@ -26,27 +27,8 @@ const sandbox = {
 };
 vm.createContext(sandbox);
 for (const [n, next] of [
-  ['speedDuration', 'syncSpeedControls'],
-  ['syncSpeedControls', 'setSpeed'],
-  ['setSpeed', 'speedUnderPlayhead'],
   ['normalizeSpeeds', 'speedTotal'],
 ]) vm.runInContext(grab(n, next), sandbox);
-
-// no regions: the output is the whole clip
-assert.equal(sandbox.speedDuration(), 10);
-
-// 2x over 4 s saves half of it
-state.speeds = [{ a: 3, b: 7, speed: 2 }];
-assert.equal(sandbox.speedDuration(), 8);
-
-// 0.5x over 4 s adds 4 s
-state.speeds = [{ a: 3, b: 7, speed: 0.5 }];
-assert.equal(sandbox.speedDuration(), 14);
-
-// trims and speed compose: keep 2..8 of a 1x clip, halve 4..6
-state.speeds = [{ a: 4, b: 6, speed: 0.5 }];
-state.trims = [{ a: 2, b: 8 }];
-assert.equal(sandbox.speedDuration(), 8); // 6 s kept, +2 s from the slow part
 
 // overlapping regions: the newcomer keeps only what lies past the older one
 state.trims = [];
@@ -67,4 +49,4 @@ state.speeds = [{ a: 1, b: 3.5, speed: 2 }];
 const lines = [`speed ${state.speeds[0].a.toFixed(3)} ${state.speeds[0].b.toFixed(3)} ${state.speeds[0].speed.toFixed(3)}`];
 assert.equal(lines[0], 'speed 1.000 3.500 2.000');
 
-console.log('PASS: speed regions — source time, trims, overlap, clamp and serialization');
+console.log('PASS: speed regions — overlap, clamp and serialization');
