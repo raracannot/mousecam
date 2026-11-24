@@ -404,7 +404,9 @@ pub fn mux_audio(
     cmd.arg("-map").arg("0:v:0");
     let graph_has_apad = pieces.filter(|l| !l.is_empty()).is_none();
     if let Some(list) = pieces.filter(|l| !l.is_empty()) {
-        cmd.arg("-filter_complex").arg(audio_graph(tracks.len(), list));
+        // `-t dur` is what stops the padded track, so only pad when the caller
+        // is capping the result.
+        cmd.arg("-filter_complex").arg(audio_graph(tracks.len(), list, dur.is_some()));
         cmd.arg("-map").arg("[out]");
     } else if tracks.len() == 1 {
         cmd.arg("-map").arg("1:a:0").arg("-af").arg("apad");
@@ -457,6 +459,11 @@ pub fn mux_audio(
 /// stages of 2×. Anything outside [0.5, 2.0] is split until it fits.
 fn atempo_chain(mut speed: f64) -> Vec<f64> {
     let mut out = Vec::new();
+    // An un-sped piece needs no filter at all; atempo=1.0 is a no-op that still
+    // costs a resampler in the graph.
+    if (speed - 1.0).abs() < 1e-6 {
+        return out;
+    }
     while speed > 2.0 {
         out.push(2.0);
         speed /= 2.0;
@@ -475,7 +482,7 @@ fn atempo_chain(mut speed: f64) -> Vec<f64> {
 ///
 /// One graph serves every track: the pieces are mixed per track first, then
 /// concatenated in timeline order.
-fn audio_graph(tracks: usize, pieces: &[AudioPiece]) -> String {
+fn audio_graph(tracks: usize, pieces: &[AudioPiece], pad: bool) -> String {
     let mut g = String::new();
     for (ti, _) in (0..tracks).enumerate() {
         let src = ti + 1; // input 0 is the video
@@ -507,11 +514,15 @@ fn audio_graph(tracks: usize, pieces: &[AudioPiece]) -> String {
         }
     }
     let all: String = (0..tracks).map(|i| format!("[a{i}]")).collect();
+    // Pad the tail: a trimmed timeline can outrun the recorded audio (a cut that
+    // reaches past the end of the WAV), and without this the graph simply ends
+    // early while the picture keeps going.
+    let tail = if pad { "apad" } else { "anull" };
     if tracks == 1 {
-        g.push_str(&format!("{all}anull[out]"));
+        g.push_str(&format!("{all}{tail}[out]"));
     } else {
         g.push_str(&format!(
-            "{all}amix=inputs={tracks}:duration=longest:normalize=0[out]"
+            "{all}amix=inputs={tracks}:duration=longest:normalize=0[mix];[mix]{tail}[out]"
         ));
     }
     g
@@ -536,4 +547,40 @@ pub fn media_duration(ffmpeg: &Path, file: &Path) -> f64 {
     let m: f64 = it.next().and_then(|v| v.trim().parse().ok()).unwrap_or(0.0);
     let s: f64 = it.next().and_then(|v| v.trim().parse().ok()).unwrap_or(0.0);
     h * 3600.0 + m * 60.0 + s
+}
+
+#[cfg(test)]
+mod audio_graph_tests {
+    use super::*;
+
+    fn piece(a: f64, b: f64, speed: f64) -> AudioPiece {
+        AudioPiece { a, b, speed }
+    }
+
+    /// A trimmed timeline can outrun the recorded WAV. The graph has to pad the
+    /// tail, otherwise the audio stream simply stops while the picture goes on.
+    #[test]
+    fn padded_graph_ends_with_apad() {
+        let g = audio_graph(1, &[piece(0.0, 2.0, 1.0)], true);
+        assert!(g.ends_with("apad[out]"), "{g}");
+
+        let g = audio_graph(2, &[piece(0.0, 2.0, 1.0), piece(2.0, 4.0, 2.0)], true);
+        assert!(g.ends_with("[mix]apad[out]"), "{g}");
+    }
+
+    /// Without a `-t` cap, an endless pad would loop forever, so it is only
+    /// added when the caller says how long the result should be.
+    #[test]
+    fn unpadded_graph_does_not_loop() {
+        let g = audio_graph(1, &[piece(0.0, 2.0, 1.0)], false);
+        assert!(g.ends_with("anull[out]"), "{g}");
+    }
+
+    /// Speed changes have to be split because atempo only accepts 0.5..2.
+    #[test]
+    fn atempo_is_split_for_extreme_rates() {
+        assert_eq!(atempo_chain(1.0), Vec::<f64>::new());
+        assert_eq!(atempo_chain(4.0), vec![2.0, 2.0]);
+        assert_eq!(atempo_chain(0.25), vec![0.5, 0.5]);
+    }
 }

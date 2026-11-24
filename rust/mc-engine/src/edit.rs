@@ -326,7 +326,37 @@ pub fn parse_edit(text: &str) -> EditList {
     }
     e.kf.sort_by(|a, b| a.t.partial_cmp(&b.t).unwrap_or(std::cmp::Ordering::Equal));
     normalize_speeds(&mut e.speeds);
+    normalize_trims(&mut e.trims);
     e
+}
+
+/// Sorts, clamps and merges the kept ranges.
+///
+/// The frame map and the speed map normalise differently - the frame map walks
+/// frames and drops anything that does not advance, the speed map walks kept
+/// segments - so a hand-written `.mcl` with an unsorted or overlapping `trim`
+/// rendered differently depending on whether it also carried a `speed` line.
+/// Doing it once, here, is what keeps the two paths on the same timeline.
+pub fn normalize_trims(trims: &mut Vec<(f64, f64)>) {
+    for t in trims.iter_mut() {
+        if t.0 < 0.0 {
+            t.0 = 0.0;
+        }
+        if t.1 < t.0 {
+            std::mem::swap(&mut t.0, &mut t.1);
+        }
+    }
+    trims.retain(|t| t.1 - t.0 > 1e-6);
+    trims.sort_by(|a, b| a.0.partial_cmp(&b.0).unwrap_or(std::cmp::Ordering::Equal));
+    let mut merged: Vec<(f64, f64)> = Vec::with_capacity(trims.len());
+    for &(a, b) in trims.iter() {
+        match merged.last_mut() {
+            // overlapping or touching: one continuous range
+            Some(last) if a <= last.1 + 1e-6 => last.1 = last.1.max(b),
+            _ => merged.push((a, b)),
+        }
+    }
+    *trims = merged;
 }
 
 /// Where the camera should aim: manual keyframes win inside their span.
@@ -404,8 +434,13 @@ pub fn kept_segments(clip_duration: f64, edit: &EditList) -> Vec<(f64, f64, f64)
         }
         return out;
     }
+    // Defensive: EditList can be built in code as well as parsed, so the same
+    // normalisation has to happen on the way in to every consumer.
+    let mut trims = edit.trims.clone();
+    normalize_trims(&mut trims);
     let mut cursor = 0.0;
-    for &(a, b) in &edit.trims {
+    for (a, b) in trims {
+        let a = a.max(0.0);
         let b = b.min(clip_duration);
         if b <= a {
             continue;
@@ -420,8 +455,10 @@ pub fn build_frame_map(frame_count: i32, fps: i32, edit: &EditList) -> Vec<i32> 
     if edit.trims.is_empty() {
         return (0..frame_count).collect();
     }
+    let mut trims = edit.trims.clone();
+    normalize_trims(&mut trims);
     let mut map: Vec<i32> = Vec::new();
-    for (a, b) in &edit.trims {
+    for (a, b) in &trims {
         let start = ((a * fps as f64).floor() as i32).max(0);
         let end = ((b * fps as f64).ceil() as i32).min(frame_count);
         for i in start..end {
@@ -638,5 +675,57 @@ mod speed_tests {
         assert!(!m.is_empty());
         assert!(m.windows(2).all(|w| w[0] <= w[1]));
         assert!(*m.last().unwrap() < 600);
+    }
+}
+
+#[cfg(test)]
+mod trim_tests {
+    use super::*;
+
+    fn segs(trims: &[(f64, f64)]) -> EditList {
+        let mut e = EditList::default();
+        e.trims = trims.to_vec();
+        e
+    }
+
+    /// A negative start used to be clamped by one path and not the other: the
+    /// frame map began at frame 0 while the speed map began five seconds before
+    /// the clip and froze on the first frame.
+    #[test]
+    fn negative_start_is_clamped_by_both_paths() {
+        let e = segs(&[(-5.0, 10.0)]);
+        let s = kept_segments(20.0, &e);
+        assert_eq!(s.len(), 1);
+        assert!(s[0].0.abs() < 1e-9, "kept segment starts at {}", s[0].0);
+        assert!((s[0].1 - 10.0).abs() < 1e-9);
+
+        let m = build_frame_map(600, 30, &e);
+        assert_eq!(m.first(), Some(&0));
+        assert!((m.len() as f64 - 300.0).abs() <= 1.0, "{} frames", m.len());
+    }
+
+    /// Overlapping and out-of-order trims used to play the overlap twice in the
+    /// speed path and drop it in the frame path.
+    #[test]
+    fn overlapping_unsorted_trims_agree_between_paths() {
+        let e = segs(&[(3.0, 8.0), (1.0, 5.0)]);
+        let s = kept_segments(20.0, &e);
+        assert_eq!(s.len(), 1, "expected one merged range, got {s:?}");
+        assert!((s[0].0 - 1.0).abs() < 1e-9 && (s[0].1 - 8.0).abs() < 1e-9);
+
+        let m = build_frame_map(600, 30, &e);
+        let s_frames: f64 = s.iter().map(|(a, b, _)| b - a).sum::<f64>() * 30.0;
+        assert!(
+            (m.len() as f64 - s_frames).abs() <= 2.0,
+            "frame map {} vs segments {:.0}",
+            m.len(),
+            s_frames
+        );
+    }
+
+    #[test]
+    fn parse_normalises_trims_like_speeds() {
+        let e = parse_edit("trim 3 8\ntrim -2 5\ntrim 2 4\n");
+        assert_eq!(e.trims, vec![(0.0, 8.0)]);
     }
 }
