@@ -262,21 +262,25 @@ pub fn render_clip(
             );
         }
 
-        if let Some(spr) = &sprite {
-            let mpt: Vec2 = cursor_at(&draw_track, edit, target as f64 / s.fps as f64);
-            let sc = out_w as f32 / rw as f32;
-            // same rule as the live recorder, taken from the baked rect so an
-            // export matches what was on screen while recording
-            let grow = crate::camera::growth_factor(rw as f32, out_w, s.zoom);
-            draw(
-                &mut crop_buf,
-                out_w,
-                out_h,
-                (mpt.x - r.x as f32) * sc,
-                (mpt.y - r.y as f32) * sc,
-                sc * grow,
-                spr,
-            );
+        // 0.2+ paints the pointer into the master, so cropping it already
+        // carries one arrow; compositing another would show two.
+        if should_composite_pointer(clip) {
+            if let Some(spr) = &sprite {
+                let mpt: Vec2 = cursor_at(&draw_track, edit, target as f64 / s.fps as f64);
+                let sc = out_w as f32 / rw as f32;
+                // same rule as the live recorder, taken from the baked rect so an
+                // export matches what was on screen while recording
+                let grow = crate::camera::growth_factor(rw as f32, out_w, s.zoom);
+                draw(
+                    &mut crop_buf,
+                    out_w,
+                    out_h,
+                    (mpt.x - r.x as f32) * sc,
+                    (mpt.y - r.y as f32) * sc,
+                    sc * grow,
+                    spr,
+                );
+            }
         }
 
         if writer.write_frame(&crop_buf).is_err() {
@@ -319,4 +323,46 @@ fn log_line(msg: &str) {
 /// Exposed for the CLI: duration probe of the master.
 pub fn clip_duration(ffmpeg: &Path, clip: &ClipInfo) -> f64 {
     _dur(ffmpeg, &clip.master)
+}
+
+/// Whether the export has to paint a pointer of its own.
+///
+/// The recorder copy is the authority: a take that already has the pointer in
+/// the master must not get a second one, or the export shows two arrows.
+fn should_composite_pointer(clip: &ClipInfo) -> bool {
+    !clip.pointer_in_master
+}
+
+#[cfg(test)]
+mod pointer_tests {
+    use super::should_composite_pointer;
+    use crate::clip::ClipInfo;
+    use std::path::PathBuf;
+
+    fn clip(pointer_in_master: bool) -> ClipInfo {
+        ClipInfo {
+            dir: PathBuf::new(),
+            master: PathBuf::new(),
+            pointer_in_master,
+            mon: crate::camera::IRect::new(0, 0, 1920, 1080),
+            fps: 30,
+            frame_count: 1,
+            duration: 1.0,
+            track: Vec::new(),
+            frame_ticks: Vec::new(),
+        }
+    }
+
+    /// A 0.2+ take already has the arrow in the master; drawing another put two
+    /// cursors in the exported clip.
+    #[test]
+    fn take_with_pointer_in_master_is_not_painted_again() {
+        assert!(!should_composite_pointer(&clip(true)));
+    }
+
+    /// Older takes have no pointer in the master, so the export supplies one.
+    #[test]
+    fn take_without_pointer_gets_one_composited() {
+        assert!(should_composite_pointer(&clip(false)));
+    }
 }
