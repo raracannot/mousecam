@@ -122,6 +122,11 @@ const state = {
   proxyReady: false,
   proxyStale: false,
   useVideo: false,
+  // Baked stills, keyed by output second. A still costs one ffmpeg decode
+  // (~250 ms); replaying the same stretch would otherwise pay that again for
+  // every frame. Dropped whenever the edit changes.
+  stillCache: new Map(),
+  stillCacheKey: '',
 };
 
 const DEFAULTS = { ...state.edit };
@@ -1132,6 +1137,7 @@ async function selectClip(dir) {
   state.frame = 0;
   state.viewImg = null;
   state.cropImg = null;
+  clearStillCache();
   $('monInfo').textContent = `${c.mon_w}×${c.mon_h} · ${c.fps}fps`;
   $('tcTotal').textContent = tc(c.duration);
   state.track = await invoke('track_points', { dir: c.dir });
@@ -1230,6 +1236,30 @@ function seekVideos(t) {
   }
 }
 
+// Anything that changes what a still would look like invalidates the cache.
+function stillCacheKey() {
+  return [
+    state.clip ? state.clip.dir : '',
+    editText(),
+    state.bake ? `${state.bake.frames}:${state.bake.fps}` : '',
+  ].join('\n');
+}
+
+function clearStillCache() {
+  state.stillCache.clear();
+  state.stillCacheKey = '';
+}
+
+const STILL_CACHE_MAX = 400;
+
+// The cache is keyed on the OUTPUT second, not the frame: that is the clock the
+// user scrubs on, and it is the same position a replay comes back to.
+function stillBucket() {
+  const fps = state.bake ? state.bake.fps : 30;
+  const outT = srcToOut(state.frame / fps);
+  return Math.round(outT * fps);
+}
+
 function scheduleStill() {
   const fps = state.bake ? state.bake.fps : 30;
   const cropFromVideo = state.proxyReady && !state.proxyStale;
@@ -1244,27 +1274,116 @@ function scheduleStill() {
     drawRight();
     return;
   }
+
+  const key = stillCacheKey();
+  if (key !== state.stillCacheKey) {
+    clearStillCache();
+    state.stillCacheKey = key;
+  }
+
+  // A frame already baked for this edit draws straight from memory. A
+  // prefetched entry may carry only the crop, so a viewport that needs the
+  // full frame falls through to a fresh render instead of showing a blank.
+  const hit = state.stillCache.get(stillBucket());
+  if (hit) {
+    state.viewImg = hit.view;
+    state.cropImg = hit.crop;
+    drawLeft();
+    drawRight();
+    return;
+  }
+
   state.stillPending = true;
+  // A new position outranks the speculative fill: drop whatever it was baking.
+  prefetchToken++;
   if (state.stillInFlight) return;
   state.stillInFlight = true;
-  (async () => {
+  runStillQueue();
+}
+
+// Bakes one still and files it under its bucket. Shared by the on-demand path
+// and the prefetcher, so a frame fetched ahead of the playhead lands in the same
+// place one fetched on demand would.
+async function bakeStill(bucket) {
+  const cached = state.stillCache.get(bucket);
+  if (cached) return cached;
+  const [view, crop] = await Promise.all([fetchStill('view', 900), fetchStill('crop', 620)]);
+  const [vi, ci] = await Promise.all([loadImg(view), loadImg(crop)]);
+  if (state.stillCache.size >= STILL_CACHE_MAX) {
+    const oldest = state.stillCache.keys().next().value;
+    state.stillCache.delete(oldest);
+  }
+  const entry = { view: vi, crop: ci };
+  state.stillCache.set(bucket, entry);
+  return entry;
+}
+
+// Dragging the playhead asks for many frames in a row. Decoding them one at a
+// time never keeps up, so after the visible one lands we idle-fill the frames
+// either side of it: the next drag over the same stretch is then instant.
+//
+// The fill yields the moment the user moves the playhead again, so it can never
+// starve what the eye is waiting for.
+const PREFETCH_SPAN = 12;
+let prefetchToken = 0;
+
+async function prefetchAround(bucket) {
+  const token = ++prefetchToken;
+  const lastFrame = (state.bake ? state.bake.frames : 1) - 1;
+  for (let d = 1; d <= PREFETCH_SPAN; d++) {
+    if (token !== prefetchToken || state.playing || state.stillPending || !state.clip) return;
+    for (const dir of [d, -d]) {
+      const f = bucket + dir;
+      if (f < 0 || f > lastFrame || state.stillCache.has(f)) continue;
+      if (token !== prefetchToken || state.playing || state.stillPending) return;
+      try {
+        await bakeStill(f);
+      } catch {
+        /* a prefetch that fails is not worth reporting */
+      }
+    }
+  }
+}
+
+async function runStillQueue() {
+  try {
     while (state.stillPending && state.clip) {
       state.stillPending = false;
       const f = state.frame;
+      const bucket = stillBucket();
+      const cached = state.stillCache.get(bucket);
+      if (cached) {
+        state.viewImg = cached.view;
+        state.cropImg = cached.crop;
+        drawLeft();
+        drawRight();
+        continue;
+      }
       try {
-        const [view, crop] = await Promise.all([fetchStill('view', 900), fetchStill('crop', 620)]);
+        const entry = await bakeStill(bucket);
         if (Math.abs(f - state.frame) < 2) {
-          state.viewImg = await loadImg(view);
-          state.cropImg = await loadImg(crop);
+          state.viewImg = entry.view;
+          state.cropImg = entry.crop;
         }
         drawLeft();
         drawRight();
+        // Fill the neighbourhood in the background. Awaiting it here would hold
+        // the queue for seconds, so a drag during the fill would find the pane
+        // frozen on a stale frame.
+        if (!state.stillPending) prefetchAround(bucket);
       } catch (e) {
         /* seek/decode race — ignore */
       }
     }
+  } finally {
     state.stillInFlight = false;
-  })();
+    // A request that arrived while the queue was winding down would otherwise
+    // leave the pane blank until the next scrub.
+    if (state.stillPending && state.clip) {
+      state.stillInFlight = true;
+      runStillQueue();
+    }
+  }
 }
 
 function loadImg(src) {
